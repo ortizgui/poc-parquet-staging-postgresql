@@ -162,6 +162,82 @@ Arquivo Parquet:
 
 Cada Worker baixa **apenas o que precisa** via Range GET — uma requisição HTTP que pede bytes específicos do arquivo. Sem download do arquivo inteiro. Sem estourar RAM.
 
+### 4. Validacao em lote + INSERT em batch — por que nao inserir linha a linha?
+
+Apos baixar o row group, o worker precisa validar e inserir os dados no PostgreSQL.
+A abordagem ingenua seria inserir cada linha individualmente:
+
+```
+Ruim (insert individual):                Bom (batch INSERT):
+────────────────────────                 ────────────────────
+for linha in 5000 linhas:                for linha in 5000 linhas:
+    valida(linha)                            valida(linha)
+    INSERT INTO staging ...              valid_rows.append( (tupla) )
+                                         invalid_rows.append( (tupla) )
+                                          ─────────────────────────────
+                                          1 INSERT INTO staging VALUES
+                                            (linha1), (linha2), ..., (linhaN)
+                                          1 INSERT INTO error VALUES
+                                            (linha1), (linha2), ..., (linhaN)
+
+5000 INSERTs no DB                      2 INSERTs no DB
+5000 round-trips                        2 round-trips
+```
+
+O PostgreSQL e otimizado para **operacoes em lote**. Cada INSERT individual
+gera um round-trip de rede, uma transacao interna no WAL, e consumo de CPU
+no planner. Agrupar N linhas em um unico `INSERT INTO ... VALUES (...), (...), ...`
+reduz o overhead de ~N para ~1.
+
+#### Como fica o fluxo completo dentro de cada worker
+
+```
+Worker (1 row group)
+│
+├─ PASSO 1: Range GET -> DataFrame (N linhas na RAM)
+│
+├─ PASSO 2: Loop UNICO validando N linhas
+│   ├─ valida -> valid_rows.append( (col1, col2, ...) )
+│   └─ invalida -> invalid_rows.append( (col1, col2, ...) )
+│
+├─ PASSO 3: execute_values(INSERT INTO staging VALUES %s, valid_rows)
+│            -> 1 statement, cur.rowcount = inseridas de fato
+│
+├─ PASSO 4: execute_values(INSERT INTO error VALUES %s, invalid_rows)
+│            -> 1 statement
+│
+└─ PASSO 5: COMMIT
+```
+
+#### E a memoria?
+
+As listas `valid_rows` e `invalid_rows` contem **tuplas Python**, nao copias do DataFrame.
+Cada tupla com 9 colunas ocupa ~100 bytes.
+
+```
+Tamanho do row group    DataFrame   +   Listas batch    =   Total / worker
+────────────────────    ─────────       ────────────        ─────────────
+50k linhas              ~20 MB          ~5 MB               ~25 MB
+100k linhas             ~40 MB          ~10 MB              ~50 MB
+250k linhas             ~100 MB         ~25 MB              ~125 MB
+
+Regra pratica: row group de 100k linhas = ~50 MB por worker.
+Com 4 workers simultaneos = ~200 MB total. Confortavel.
+```
+
+O **tamanho do row group** e o controle de memoria. Na geracao do Parquet:
+
+```python
+# create_sample_file.py
+import pyarrow as pa
+table = pa.Table.from_pandas(df)
+# Define quantas linhas por row group
+pa.parquet.write_table(table, "arquivo.parquet", row_group_size=50000)
+```
+
+Para producao, ajuste `row_group_size` para que cada worker processe
+confortavelmente dentro da RAM disponivel (ex: 50k-100k linhas por grupo).
+
 ---
 
 ## Stack tecnológica
