@@ -195,6 +195,8 @@ WHERE relname = 'custody_position';
 
 > ⚠️ **AVISO**: `VACUUM FULL` é exclusivo e bloqueia a tabela. Use apenas em janelas de manutenção. O `VACUUM` padrão (sem FULL) roda concorrentemente com leituras e escritas.
 
+> 💡 **Nota para RDS Aurora PostgreSQL**: O **Aurora gerencia o storage de forma distribuída** e o **autovacuum** já vem habilitado e configurado pela AWS com parâmetros adequados no `DB cluster parameter group`. Em produção com Aurora, você **não precisa se preocupar com VACUUM manual** — o serviço cuida disso automaticamente. O entendimento conceitual de dead tuples continua importante para dimensionamento e modelagem, mas a operação é transparente.
+
 ---
 
 ## Particionamento (Item 6)
