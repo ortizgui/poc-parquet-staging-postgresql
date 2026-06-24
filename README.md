@@ -1,51 +1,39 @@
-# POC — Processamento Batch de Parquet → PostgreSQL
+# POC v2 — Processamento Batch de Parquet → SQS → PostgreSQL
 
-Prova de conceito de um pipeline batch que lê arquivos Parquet do S3, valida registros em paralelo, insere em staging e faz merge upsert na tabela final — tudo rodando localmente com Docker.
+Segunda versão da prova de conceito. Agora com **fila SQS entre a leitura do Parquet e o banco**, demonstrando desacoplamento entre produtor e consumidor.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    PIPELINE DE PROCESSAMENTO BATCH                   │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  S3 (MiniStack)                                                      │
-│  ┌──────────────────┐            ┌──────────────────────────────┐   │
-│  │ custody_position │  Range    │  Python: process_file.py      │   │
-│  │   .parquet       │──GET────▶│  ┌──────────────────────────┐ │   │
-│  │   (24 linhas)    │           │  │ 1. Lê footer (metadata) │ │   │
-│  └──────────────────┘           │  │ 2. Worker pool:         │ │   │
-│       ▲                         │  │    ├─ Worker 1 → RG 0   │ │   │
-│       │ upload                  │  │    ├─ Worker 2 → RG 1   │ │   │
-│  ┌────┴───────────┐             │  │    └─ Worker N → RG N   │ │   │
-│  │ create_sample  │             │  │ 3. Valida cada linha    │ │   │
-│  │ _file.py       │             │  │ 4. Válido → staging     │ │   │
-│  └────────────────┘             │  │ 5. Inválido → erro      │ │   │
-│                                 └──┼───────────────────────────┘   │
-│                                    │                               │
-│           ┌────────────────────────┼───────────────────┐           │
-│           │                        ▼                   │           │
-│           │     ┌──────────────────────────────────┐   │           │
-│           │     │     PostgreSQL (pocdb)            │   │           │
-│           │     │                                  │   │           │
-│           │     │  ┌──────────────────────────┐   │   │           │
-│           │     │  │ custody_position_error   │   │   │           │
-│     merge │     │  │ (registros inválidos)    │   │   │           │
-│     staging.py  │  └──────────────────────────┘   │   │           │
-│           │     │                                  │   │           │
-│           │     │  ┌──────────────────────────┐   │   │           │
-│           └─────│▶│ custody_position_staging  │───┘   │           │
-│                 │  │ (PENDING → MERGED)       │       │           │
-│                 │  └──────────┬───────────────┘       │           │
-│                 │             │ upsert (batch)         │           │
-│                 │             ▼                        │           │
-│                 │  ┌──────────────────────────┐   │   │           │
-│                 │  │ custody_position (final) │   │   │           │
-│                 │  │ (3 seed + 17 novos)      │   │   │           │
-│                 │  └──────────────────────────┘   │   │           │
-│                 └──────────────────────────────────┘   │           │
-└─────────────────────────────────────────────────────────────────────┘
+S3 Notification
+      │
+      ▼
+┌──────────────────────┐
+│  parquet_to_sqs.py    │  ← ECS Task 1 (produtor)
+│  Le o Parquet em      │
+│  streaming e envia    │
+│  cada registro para   │
+│  uma fila SQS         │
+└──────────┬───────────┘
+           │
+           ▼
+   ┌───────────────┐
+   │  SQS Queue     │  ← Buffer de mensagens
+   │  (poc-queue)   │    (at-least-once delivery)
+   └───────┬───────┘
+           │
+           ▼
+┌──────────────────────┐
+│  process_sqs_to_db.py│  ← ECS Task 2 (consumidor)
+│  Recebe lotes do SQS,│
+│  valida e insere em  │
+│  batch no PostgreSQL │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  merge_staging.py     │  ← Merge upsert
+│  Staging → Final      │
+└──────────────────────┘
 ```
-
----
 
 ## Índice
 
@@ -56,226 +44,115 @@ Prova de conceito de um pipeline batch que lê arquivos Parquet do S3, valida re
 5. [Setup do ambiente](#setup-do-ambiente)
 6. [Execução do pipeline](#execução-do-pipeline)
 7. [O papel de cada tabela](#o-papel-de-cada-tabela)
-8. [Idempotência: camada por camada](#idempotência-camada-por-camada)
-9. [Decisões de arquitetura](#decisões-de-arquitetura)
-10. [Comparação: Row Groups vs SQS por Registro](#comparação-row-groups-vs-sqs-por-registro)
+8. [Idempotência](#idempotência)
+9. [SQS: decisões de design](#sqs-decisões-de-design)
+10. [Comparação: v1 (direto) vs v2 (SQS)](#comparação-v1-direto-vs-v2-sqs)
 11. [E se algo der errado?](#e-se-algo-der-errado)
-12. [VACUUM](#vacuum)
-13. [Particionamento](#particionamento)
-14. [MiniStack / LocalStack](#ministack--localstack)
-15. [Troubleshooting](#troubleshooting)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Problema de negócio
 
-Instituições financeiras precisam processar diariamente **arquivos de posição de custódia** vindos de fontes externas (B3, custodiantes, administradores fiduciários). Estes arquivos contêm:
+Instituições financeiras precisam processar diariamente arquivos de posição de custódia.
+A v2 resolve o mesmo problema da v1, mas com uma **arquitetura desacoplada por fila**,
+adequada para cenários onde:
 
-- **Registros novos**: ativos que entraram na carteira do cliente
-- **Registros de atualização**: mesma posição do dia anterior, mas com saldo diferente
-- **Registros inválidos**: dados inconsistentes que precisam ser reportados sem quebrar o fluxo
-
-### Requisitos críticos
-
-| Requisito | Por quê |
-|-----------|---------|
-| **Não perder dados** | Cada registro representa dinheiro real de clientes |
-| **Idempotência** | Reprocessar o mesmo arquivo não pode gerar duplicatas |
-| **Rastreabilidade** | Saber exatamente qual lote originou cada registro |
-| **Isolamento** | Dados em processamento não podem poluir a tabela final |
-| **Escalabilidade** | O mesmo design precisa funcionar para 24 ou 24 milhões de linhas |
-| **Custo zero de licença** | Tudo open source, sem dependência de AWS real |
+- O produtor e consumidor podem escalar independentemente
+- O volume de dados varia (a fila absorve picos)
+- Diferentes times são responsáveis pela ingestão e pelo processamento
+- Há necessidade de reprocessamento seletivo sem re-download do Parquet
 
 ---
 
 ## Por que esta arquitetura?
 
-### O fluxo em alto nível
+### Fluxo completo
 
 ```
-ARQUIVO BRUTO              ÁREA DE PREPARAÇÃO              DADO CONFIÁVEL
-─────────────────      ────────────────────────        ─────────────────
-S3 (Parquet) ──────▶  custody_position_staging ──────▶  custody_position
-                      (validação + batch_id)            (final, consistente)
-                             │
-                             └─▶ custody_position_error
-                                 (diagnóstico)
+S3 (Parquet)
+    │
+    ▼
+parquet_to_sqs.py
+    │  Leitura streaming via s3fs (Range GET)
+    │  Para cada linha → mensagem JSON
+    │  Envia em lotes de 10 para SQS
+    │  Sem validacao — tudo vai para fila
+    ▼
+SQS Queue (poc-queue)
+    │
+    ▼
+process_sqs_to_db.py
+    │  Recebe ate 10 mensagens por vez (long polling)
+    │  Valida cada registro
+    │  Batch INSERT validos → staging
+    │  Batch INSERT invalidos → error table
+    │  Deleta mensagens processadas
+    ▼
+merge_staging.py
+    │  Merge upsert em lotes
+    │  Staging (PENDING) → Final
+    ▼
+custody_position (final)
 ```
 
-Cada etapa tem uma responsabilidade única e isolada:
+### Por que SQS entre o Parquet e o banco?
 
-### 1. Staging — por que não inserir direto na final?
-
-A staging existe como **área de preparação (buffer)** entre o dado bruto e o dado confiável:
+A v1 inseria direto na staging (via batch INSERT). A v2 adiciona uma fila SQS:
 
 ```
-SEM STAGING:                     COM STAGING:
-─────                            ─────
-S3 → Tabela Final                S3 → Staging → Merge → Final
-                                  │
-Se o processo morre no meio:      Se o merge morre:
-  Metade dos dados na final       Staging intacta (PENDING)
-  Sem saber o que já entrou       Reprocessa merge, não o download
-  Precisa truncar e recomeçar     Dados brutos preservados na staging
-
-Staging também permite:
-  • Auditoria: batch_id, source_file, row_number por registro
-  • Validação antes de expor à consulta
-  • Rollback sem truncar tabela final
-  • Reprocessamento seletivo (só o merge)
+v1 (direto):       S3 → process_file.py → staging → merge → final
+v2 (SQS):          S3 → parquet_to_sqs.py → SQS → process_sqs_to_db.py → staging → merge → final
 ```
 
-### 2. Batch merge — por que não um upsert gigante?
+Benefícios da fila:
 
-Um único `INSERT ... ON CONFLICT DO UPDATE` para milhões de linhas é uma **transação monolithic**:
+| Benefício | Explicação |
+|-----------|------------|
+| **Desacoplamento** | Produtor e consumidor escalam independentemente |
+| **Buffer de picos** | SQS segura mensagens se o banco estiver lento |
+| **Reprocessamento granular** | Mensagens que falharam voltam para a fila automaticamente |
+| **Paralelismo** | Multiplos consumidores processam a mesma fila |
+| **Resiliência** | Se o consumer morre, a mensagem volta pra fila em 30s |
 
-```
-Monolithic (ruim):                   Batch (bom):
-─────────────────                    ────────────
-BEGIN;                               BEGIN;  -- lote 1/100
-  INSERT 10M linhas ON CONFLICT        INSERT WHERE NOT EXISTS
-COMMIT; -- 45 minutos                  UPDATE via JOIN
-                                       COMMIT; -- 3 segundos
-Riscos:                               BEGIN;  -- lote 2/100
-  • Lock na tabela final por horas      ...
-  • WAL de 50 GB no disco            Se lote 5 falha:
-  • Rollback desfaz TUDO               • Só lote 5 perdeu
-  • max_locks_per_transaction          • Lotes 1-4 já comitaram
-                                       • Reprocessa só lote 5
-```
+### Custo da fila
 
-### 3. Streaming de row groups — por que não baixar o arquivo inteiro?
-
-Arquivos Parquet são divididos internamente em **Row Groups** (grupos de linhas). Cada Row Group tem seus próprios dados e metadados:
-
-```
-Arquivo Parquet:
-┌──────────────────────────────────────────────────────────┐
-│ Magic │ Row Group 0  │ Row Group 1 │ ... │ Row Group N │ Footer │
-│Bytes  │ (10k linhas) │ (10k linhas)│     │ (10k linhas)│(meta)  │
-└──────────────────────────────────────────────────────────┘
-         ▲              ▲                   ▲
-         │              │                   │
-    Worker 1       Worker 2            Worker N
-    (Range GET)    (Range GET)         (Range GET)
-```
-
-Cada Worker baixa **apenas o que precisa** via Range GET — uma requisição HTTP que pede bytes específicos do arquivo. Sem download do arquivo inteiro. Sem estourar RAM.
-
-### 4. Validacao em lote + INSERT em batch — por que nao inserir linha a linha?
-
-Apos baixar o row group, o worker precisa validar e inserir os dados no PostgreSQL.
-A abordagem ingenua seria inserir cada linha individualmente:
-
-```
-Ruim (insert individual):                Bom (batch INSERT):
-────────────────────────                 ────────────────────
-for linha in 5000 linhas:                for linha in 5000 linhas:
-    valida(linha)                            valida(linha)
-    INSERT INTO staging ...              valid_rows.append( (tupla) )
-                                         invalid_rows.append( (tupla) )
-                                          ─────────────────────────────
-                                          1 INSERT INTO staging VALUES
-                                            (linha1), (linha2), ..., (linhaN)
-                                          1 INSERT INTO error VALUES
-                                            (linha1), (linha2), ..., (linhaN)
-
-5000 INSERTs no DB                      2 INSERTs no DB
-5000 round-trips                        2 round-trips
-```
-
-O PostgreSQL e otimizado para **operacoes em lote**. Cada INSERT individual
-gera um round-trip de rede, uma transacao interna no WAL, e consumo de CPU
-no planner. Agrupar N linhas em um unico `INSERT INTO ... VALUES (...), (...), ...`
-reduz o overhead de ~N para ~1.
-
-#### Como fica o fluxo completo dentro de cada worker
-
-```
-Worker (1 row group)
-│
-├─ PASSO 1: Range GET -> DataFrame (N linhas na RAM)
-│
-├─ PASSO 2: Loop UNICO validando N linhas
-│   ├─ valida -> valid_rows.append( (col1, col2, ...) )
-│   └─ invalida -> invalid_rows.append( (col1, col2, ...) )
-│
-├─ PASSO 3: execute_values(INSERT INTO staging VALUES %s, valid_rows)
-│            -> 1 statement, cur.rowcount = inseridas de fato
-│
-├─ PASSO 4: execute_values(INSERT INTO error VALUES %s, invalid_rows)
-│            -> 1 statement
-│
-└─ PASSO 5: COMMIT
-```
-
-#### E a memoria?
-
-As listas `valid_rows` e `invalid_rows` contem **tuplas Python**, nao copias do DataFrame.
-Cada tupla com 9 colunas ocupa ~100 bytes.
-
-```
-Tamanho do row group    DataFrame   +   Listas batch    =   Total / worker
-────────────────────    ─────────       ────────────        ─────────────
-50k linhas              ~20 MB          ~5 MB               ~25 MB
-100k linhas             ~40 MB          ~10 MB              ~50 MB
-250k linhas             ~100 MB         ~25 MB              ~125 MB
-
-Regra pratica: row group de 100k linhas = ~50 MB por worker.
-Com 4 workers simultaneos = ~200 MB total. Confortavel.
-```
-
-O **tamanho do row group** e o controle de memoria. Na geracao do Parquet:
-
-```python
-# create_sample_file.py
-import pyarrow as pa
-table = pa.Table.from_pandas(df)
-# Define quantas linhas por row group
-pa.parquet.write_table(table, "arquivo.parquet", row_group_size=50000)
-```
-
-Para producao, ajuste `row_group_size` para que cada worker processe
-confortavelmente dentro da RAM disponivel (ex: 50k-100k linhas por grupo).
+Cada registro vira uma mensagem SQS. Para 1M registros: 1M mensagens SQS.
+Na AWS, SQS standard custa $0.40/milhão de requests. O custo é baixo, mas existe.
 
 ---
 
 ## Stack tecnológica
 
-| Componente | Tecnologia | Versão | Função |
-|------------|-----------|--------|--------|
-| Container | Docker Compose | - | Orquestração dos serviços |
-| S3 emulator | LocalStack (MiniStack-compatível) | latest | Simula S3 sem conta AWS |
-| Banco relacional | PostgreSQL | 16 | Armazenamento relacional |
-| Streaming S3 | s3fs / fsspec | 2026.6+ | Leitura de Parquet via Range GET |
-| Parquet | pyarrow | 17+ | Leitura de row groups |
-| DataFrame | pandas | 2.2+ | Validação por linha |
-| S3 SDK | boto3 | 1.34+ | Upload/download S3 |
-| DB driver | psycopg2-binary | 2.9+ | Conexão PostgreSQL |
-| Parquet generation | pyarrow + pandas | - | Criação do arquivo de exemplo |
+| Componente | Tecnologia | Função |
+|------------|-----------|--------|
+| Container | Docker Compose | Orquestração local |
+| S3 emulator | LocalStack | S3 + SQS simulados |
+| Banco | PostgreSQL 16 | Armazenamento |
+| Streaming S3 | s3fs / pyarrow | Leitura de Parquet via Range GET |
+| SQS | boto3 (LocalStack) | Fila de mensagens |
+| DB driver | psycopg2-binary | Conexão PostgreSQL |
 
 ---
 
 ## Pré-requisitos
 
-- **Docker** e **Docker Compose** (para PostgreSQL e LocalStack)
-- **Python 3.12+** (para os scripts)
+- Docker e Docker Compose
+- Python 3.12+
 - ~2 GB de RAM livre
-- ~5 GB de disco livre
 
 ---
 
 ## Setup do ambiente
 
 ```bash
-# 1. Subir os serviços (PostgreSQL + LocalStack)
+# Subir servicos (PostgreSQL + LocalStack com S3 + SQS)
 docker compose up -d
 
-# 2. Verificar se estão saudáveis
+# Verificar se estao saudaveis
 docker compose ps
-# Esperado: ambos com status "healthy"
 
-# 3. Criar ambiente Python e instalar dependências
+# Criar ambiente Python
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -286,812 +163,240 @@ pip install -r requirements.txt
 ## Execução do pipeline
 
 ```bash
-# Etapa 1 — Gerar arquivo Parquet de exemplo (24 registros)
+# Etapa 1 — Gerar arquivo Parquet
 python scripts/create_sample_file.py
-# Output:
-#   Arquivo gerado: ./data/input/custody_position.parquet
-#   Linhas: 24
+# Output: Arquivo gerado: ./data/input/custody_position.parquet (24 linhas)
 
-# Etapa 2 — Enviar para o S3 local (MiniStack/LocalStack)
+# Etapa 2 — Enviar para o S3 local
 python scripts/upload_to_s3.py
-# Output:
-#   Bucket criado: poc-bucket
-#   Arquivo enviado: s3://poc-bucket/input/custody_position.parquet
+# Output: Bucket criado / Arquivo enviado
 
-# Etapa 3 — Processar em streaming paralelo (row groups)
-python scripts/process_file.py --bucket poc-bucket \
-                               --key input/custody_position.parquet
-# Opcional: tamanho do lote de validacao por worker (default 5)
-# python scripts/process_file.py --bucket poc-bucket --key ... --chunk-size 10
+# Etapa 3 — Produtor: ler Parquet e enviar cada registro para o SQS
+python scripts/parquet_to_sqs.py --bucket poc-bucket --key input/custody_position.parquet
 # Output:
-#   batch_id: 025c8e45-...
+#   batch_id: 4a4e6dcf-...
 #   Total linhas: 24 | Row groups: 1
-#   Row groups pendentes: 1/1
-#   RG  0: 20 validos, 4 invalidos, 0 duplicatas, 24 linhas
-#   Resumo: 20 validos, 4 invalidos
+#   RG 0: 24 linhas enviadas para SQS
+#   enviadas: 24
+#   fila SQS: http://localhost:4566/000000000000/poc-queue
 
-# Etapa 4 — Merge para tabela final (batch upsert)
+# Etapa 4 — Consumidor: ler do SQS, validar e inserir no PostgreSQL
+python scripts/process_sqs_to_db.py
+# Output:
+#   Lote: 10 msgs, 10 staging, 0 erros
+#   Lote: 10 msgs, 10 staging, 0 erros
+#   Lote: 4 msgs, 0 staging, 4 erros
+#   Nenhuma mensagem na fila. Consumidor encerrado.
+#   recebidas:  24
+#   validas:    20
+#   invalidas:  4
+#   deletadas:  24
+
+# Etapa 5 — Merge para tabela final
 python scripts/merge_staging.py
 # Output:
 #   Registros pendentes antes: 20
-#   Lote 10/20: +7 novos / ~10 atualizados
-#   Lote 20/20: +10 novos / ~10 atualizados
-#   Total final na custody_position: 20
+#   Lote 10/20: ...
+#   Lote 20/20: ...
+```
 
-# Opcional: configurar batch size do merge
-MERGE_BATCH_SIZE=5000 python scripts/merge_staging.py
+### Ordem dos consumidores
 
-# Opcional: configurar workers de processamento
-PROCESS_MAX_WORKERS=8 python scripts/process_file.py ...
+O `process_sqs_to_db.py` pode ser executado **em paralelo** com o produtor,
+ou **depois**. Se executar antes, a fila estará vazia e ele encerra.
+Se executar depois, ele consome as mensagens enfileiradas.
+
+Para simular processamento contínuo:
+
+```bash
+# Terminal 1: produtor
+python scripts/parquet_to_sqs.py --bucket poc-bucket --key input/custody_position.parquet
+
+# Terminal 2: consumidor (pode rodar antes, durante ou depois)
+python scripts/process_sqs_to_db.py
 ```
 
 ---
 
 ## O papel de cada tabela
 
-### `custody_position` (tabela final)
+(Mesmo esquema da v1 — inalterado)
 
-A tabela "fonte da verdade". Contém apenas **dados consistentes** e prontos para consulta.
-
+### `custody_position` (final)
 | Coluna | Tipo | Função |
 |--------|------|--------|
-| `account_id` | VARCHAR | Identificador da conta (ex: ACC001) |
-| `asset_id` | VARCHAR | Código do ativo (ex: PETR4) |
-| `reference_date` | DATE | Data de referência da posição |
-| `quantity` | NUMERIC(18,4) | Quantidade do ativo |
-| `amount` | NUMERIC(18,2) | Valor financeiro |
-| `updated_at` | TIMESTAMP | Última atualização |
-| **UK** | (account_id, asset_id, reference_date) | Garante 1 registro por posição |
-
-### `custody_position_staging` (área de staging)
-
-Recebe os dados crus do processamento. Cada lote é identificado por `batch_id`. Depois do merge, os registros mudam de `PENDING` para `MERGED`.
-
-| Coluna | Tipo | Função |
-|--------|------|--------|
-| `batch_id` | UUID | Identificador único do processamento |
-| `source_file` | VARCHAR | Origem do dado (ex: s3://...) |
-| `row_number` | INTEGER | Número da linha no arquivo original |
-| `record_hash` | VARCHAR | SHA256 dos dados (dedup adicional) |
-| `status` | VARCHAR | PENDING → MERGED |
-| `merged_at` | TIMESTAMP | Quando foi integrado à final |
-| **UK1** | (source_file, row_number) | Impede duplicata do mesmo arquivo |
-| **UK2** | (source_file, record_hash) | Impede duplicata do mesmo dado |
-
-### `custody_position_error` (diagnóstico)
-
-Registros que falharam validação. Permite auditoria sem travar o pipeline.
-
-| Coluna | Tipo | Função |
-|--------|------|--------|
-| `batch_id` | UUID | Lote que detectou o erro |
-| `payload` | JSONB | Cópia fiel do registro original |
-| `error_reason` | TEXT | Motivo da rejeição (ex: "account_id is empty") |
-| **UK** | (source_file, row_number) | Impede erro duplicado no reprocessamento |
-
----
-
-## Idempotência: camada por camada
-
-Idempotência significa que **executar a mesma operação N vezes produz o mesmo resultado que executar 1 vez**.
-
-```
-Camada 1 — process_file.py (download + staging)
-───────────────────────────────────────────────
-  Execução 1: baixa Parquet, insere 20 registros na staging
-  Execução 2: baixa Parquet mesmo arquivo
-    → ON CONFLICT (source_file, row_number) DO NOTHING
-    → 0 novos registros (20 ignorados como duplicatas)
-  Resultado: staging com 20 registros (não 40)
-
-Camada 2 — merge_staging.py (staging → final)
-───────────────────────────────────────────────
-  Execução 1: 20 PENDING → INSERT + UPDATE na final → marca MERGED
-  Execução 2: 0 PENDING (já foram mergeados)
-    → WHERE status = 'PENDING' retorna vazio
-    → Nada acontece
-  Resultado: final com 20 registros (não 40)
-
-Camada 3 — reprocessamento completo
-───────────────────────────────────────────────
-  process_file.py + merge_staging.py (de novo):
-  • Staging: registros ignorados (já existem)
-  • Merge: staging sem PENDING → nada a fazer
-  • Final: inalterada
-```
-
----
-
-## Decisões de arquitetura
-
-### 1. Por que `s3fs` em vez de `boto3` + `BytesIO`?
-
-```
-Critério              boto3 + BytesIO         s3fs (Range GET)
-──────────────────  ──────────────────────   ─────────────────────
-Download            Arquivo inteiro           Só o que precisa
-RAM                 Tamanho do arquivo        Tamanho do row group
-Paralelismo         Não (1 conexão)           Sim (N workers)
-Range request       Manual (Range header)     Automático (fsspec)
-Checkpoint          Requer lógica extra       ON CONFLICT + MAX()
-```
-
-`s3fs` abstrai Range GET requests e permite que o `pyarrow.ParquetFile` leia apenas os bytes necessários do S3 — sem baixar nada além do necessário.
-
-### 2. Por que `ThreadPoolExecutor` em vez de `multiprocessing`?
-
-| Característica | ThreadPoolExecutor | multiprocessing |
-|----------------|-------------------|-----------------|
-| Uso de CPU | Leve (I/O bound) | Pesado (CPU bound) |
-| Memória | Compartilhada | Duplicada (N×RAM) |
-| Complexidade | Baixa | Alta (pickle, serialização) |
-| Ideal para | Download + DB I/O | Processamento computacional |
-
-Nosso gargalo é **I/O** (download S3 + insert PostgreSQL), não CPU. Threads são a escolha correta.
-
-### 3. Por que `ON CONFLICT DO NOTHING` em vez de verificar antes?
-
-```sql
--- Abordagem "check-then-insert" (NÂO use em concorrência)
-SELECT COUNT(*) FROM staging WHERE source_file = 'x' AND row_number = 5
--- Se não existe:
-INSERT INTO staging ...
-
--- Abordagem "insert-or-ignore" (correta)
-INSERT INTO staging ... ON CONFLICT (source_file, row_number) DO NOTHING
--- Se já existe, ignora silenciosamente
-```
-
-`ON CONFLICT DO NOTHING` é **atômico**: não há janela entre o check e o insert onde outra thread pode inserir o mesmo registro. É a abordagem correta para sistemas concorrentes.
-
-### 4. Por que `FOR UPDATE SKIP LOCKED` no merge?
-
-```
-SEM SKIP LOCKED:                       COM SKIP LOCKED:
-Worker 1: SELECT ... WHERE PENDING     Worker 1: SELECT ... FOR UPDATE SKIP LOCKED
-Worker 2: SELECT ... WHERE PENDING     Worker 2: SELECT ... FOR UPDATE SKIP LOCKED
-Ambos pegam OS MESMOS registros!       Cada um pega LOTES DIFERENTES!
-Processo duplicado!                    Processo paralelo seguro!
-```
-
-`SKIP LOCKED` diz: "pule os registros que estão locked por outra transação". Isso permite múltiplos workers de merge rodando em paralelo sem pisar no mesmo lote.
-
-### 5. Por que dois passos (INSERT + UPDATE) e não `ON CONFLICT DO UPDATE`?
-
-```sql
--- Versão 1: ON CONFLICT DO UPDATE (1 passo)
-INSERT INTO custody_position (...)
-SELECT ... FROM staging
-ON CONFLICT (account_id, asset_id, reference_date) DO UPDATE
-SET quantity = EXCLUDED.quantity;
-
--- Versão 2: INSERT + UPDATE (2 passos)
-INSERT INTO custody_position (...)
-SELECT ... FROM staging s
-WHERE NOT EXISTS (SELECT 1 FROM custody_position f WHERE ...);
-
-UPDATE custody_position f
-SET quantity = s.quantity
-FROM staging s
-WHERE f.chave = s.chave;
-```
-
-Na prática, para milhões de registros:
-
-| Abordagem | Prós | Contras |
-|-----------|------|---------|
-| `ON CONFLICT DO UPDATE` | 1 comando, mais simples | Gera dead tuple para cada update |
-| Dois passos | INSERT limpo + UPDATE explícito | 2 comandos, marginalmente mais lento |
-
-**Ambas funcionam.** O dois-passos foi escolhido por clareza e por separar a contagem de inserts vs updates.
-
----
-
----
-
-### 6. Erro em uma linha: como o restante do row group continua?
-
-Esta é uma pergunta importante. A resposta depende do **tipo de erro**:
-
-```
-                         Linha do row group
-                                │
-                                ▼
-              ┌─────────────────────────────────┐
-              │  Etapa 1: Validação em Python    │ ← SEM overhead de DB
-              │  (campos obrigatórios, range)    │
-              └────────────────┬────────────────┘
-                               │
-              ┌────────────────┴────────────────┐
-              │  INVÁLIDO                        │  VÁLIDO
-              ▼                                  ▼
-   custody_position_error                 INSERT staging
-   (sem impacto no fluxo)                 (ON CONFLICT DO NOTHING)
-              │                                  │
-              └─────────── CONTINUA ──────────────┘
-```
-
-#### Erros de validação (99,99% dos casos)
-
-A validação em Python (`validate_row()`) captura **todos os erros previsíveis** antes de qualquer operação no banco:
-
-```python
-def validate_row(row):
-    if not acc_id:     errors.append("account_id is empty")
-    if not asset_id:   errors.append("asset_id is empty")
-    if qty < 0:        errors.append("quantity is invalid")
-    if amt < 0:        errors.append("amount is invalid")
-    return errors
-```
-
-Se a validação falha:
-- O registro vai para `custody_position_error` com o payload original
-- O loop `for` continua para a **próxima linha imediatamente**
-- **Zero impacto no banco** — nem chegou a tentar o INSERT
-- **Zero impacto nas outras linhas** — cada linha é independente
-
-```
-Exemplo na POC: 24 linhas processadas
-──────────────────────────────────────
-Linha 20: ACC006/INVL1, qty=-100 → VALIDACAO FALHOU → erro table → CONTINUA
-Linha 21: (vazio)/INVL2          → VALIDACAO FALHOU → erro table → CONTINUA
-Linha 22: ACC007/(vazio)         → VALIDACAO FALHOU → erro table → CONTINUA
-Linha 23: ACC008/INVL4, amt=-500 → VALIDACAO FALHOU → erro table → CONTINUA
-
-Resultado final: 20 na staging, 4 no erro, 0 interrupções
-```
-
-#### Erros de DB (raríssimos após validação)
-
-Após a validação em Python, o que pode falhar no INSERT?
-
-| Tipo de erro | Ocorre? | Por quê |
-|-------------|---------|---------|
-| UNIQUE violation | ❌ | `ON CONFLICT DO NOTHING` já trata |
-| NOT NULL violation | ❌ | Validação em Python garante |
-| Tipo inválido (ex: string em numeric) | ❌ | Parquet já tem schema tipado |
-| **Overflow numérico** (ex: qty > 10^14) | ⚠️ **RARO** | `NUMERIC(18,4)` tem limite |
-| **Encoding** (ex: caracteres especiais) | ⚠️ **RARO** | VARCHAR aceita UTF-8 |
-
-Para esses erros raros, a estratégia **NÃO é usar savepoints por linha**. Por quê?
-
-#### Por que NÃO usamos savepoints por linha?
-
-Savepoints têm custo:
-
-```
-1.000.000 de linhas = 1.000.000 de savepoints
-
-Cada savepoint:
-  • Gera registro no WAL (Write Ahead Log)
-  • Adiciona latência (SAVEPOINT + RELEASE ou ROLLBACK)
-  • Aumenta o tempo total de processamento em 10-30%
-  • Para 1M linhas, pode adicionar minutos ao processo
-```
-
-O custo-benefício não se sustenta porque erros de DB após validação **quase nunca acontecem**. Seria como colocar airbags em cada assento de um ônibus — o peso extra torna o veículo mais lento para um evento quase impossível.
-
-#### Estratégia real adotada
-
-```
-Cenário                            Estratégia
-────────────────────────────────────────────────────────────────────
-Erro de validação (99,99%):        INSERT direto na erro table
-                                   → loop continua sem custo extra
-
-Erro de DB (raro):                 Transação do row group falha
-                                   → rollback do row group inteiro
-                                   → log da exceção no terminal
-                                   → operador investiga
-
-Reprocessamento:                   Roda process_file.py de novo
-                                   → ON CONFLICT DO NOTHING
-                                   → staging já inserido é ignorado
-                                   → só processa o que falta
-```
-
-```python
-# Código real — sem savepoints, sem overhead
-for row in row_group:
-    errors = validate_row(row)
-    if errors:
-        INSERT INTO error_table ...    # sem custo extra
-        continue                       # → próxima linha
-
-    INSERT INTO staging ...            # transação normal
-    ON CONFLICT DO NOTHING             # idempotente por padrão
-
-conn.commit()  # 1 COMMIT por row group, não 1 por linha
-```
-
-Se um erro de DB acontece, a transação falha, o `conn.rollback()` é executado no `except`, e o row group inteiro precisa ser reprocessado. Mas como o erro é **extremamente raro**, o custo de reprocessar um row group é aceitável — especialmente porque `ON CONFLICT DO NOTHING` faz o reprocessamento ser rápido (as linhas já inseridas são ignoradas no INSERT, e o checkpoint pula row groups já concluídos).
-
-#### Resumo
-
-| Situação | O que acontece | Custo |
-|----------|---------------|-------|
-| **Validação falha** | INSERT na erro table, `continue` no loop | Zero (sem DB para staging) |
-| **DB insert falha** (raro) | Rollback do row group, log do erro | Reprocessar 1 row group |
-| **Conexão cai** | Rollback do row group, log do erro | Reprocessar 1 row group |
-| **Tudo ok** | COMMIT do row group | 1 COMMIT, sem savepoints |
-
-**Conclusão**: Não usamos savepoints por linha porque o custo (10-30% de overhead em 1M linhas) não justifica o benefício (proteger contra um erro que quase nunca acontece). A validação em Python cobre 99,99% dos casos sem custo de banco. Para o 0,01% restante, o reprocessamento de um row group via `ON CONFLICT DO NOTHING` é a abordagem correta.
-
-## Comparação: Row Groups vs SQS por Registro
-
-### Contexto
-
-Uma arquitetura alternativa seria transformar **cada registro** do arquivo Parquet em uma **mensagem individual em uma fila SQS**. Essa abordagem oferece alto nível de desacoplamento e reprocessamento granular, porém adiciona complexidade operacional significativa para um cenário cujo objetivo principal é realizar **carga massiva de dados em um banco PostgreSQL**.
-
-Após análise, optou-se por uma estratégia baseada em **leitura de row groups em streaming**, inserção em tabela de staging e merge para a tabela final.
-
-```
-ABORDAGEM ESCOLHIDA (Row Groups Streaming):     ALTERNATIVA (SQS por registro):
-───────────────────────────────                  ────────────────────────────────
-S3 (Parquet)                                     S3 (Parquet)
-    │                                                  │
-    ▼                                                  ▼
-Leitura do Footer (Range GET)                   Leitura do arquivo inteiro
-    │                                                  │
-    ▼                                                  ▼
-Workers paralelos (ThreadPool)                  1.000.000 mensagens SQS
-    │  cada um lê 1 row group                        │
-    ▼                                                  ▼
-Validação em lote                                1.000.000 consumers
-    │                                                  │
-    ▼                                                  ▼
-Staging Table + Error Table                      Fila + DLQ + Retry + Monitoramento
-    │                                                  │
-    ▼                                                  ▼
-Merge upsert (batch)                            1.000.000 inserts individuais
-```
-
-### 1. Menor Complexidade Arquitetural
-
-Na abordagem baseada em eventos, **cada linha** do arquivo gera uma mensagem SQS:
-
-```
-Arquivo com 1.000.000 linhas
-=
-1.000.000 mensagens SQS
-```
-
-Além da fila principal, são necessários:
-
-- Consumers (ECS/Lambda) com escalonamento
-- Dead Letter Queue (DLQ) para falhas
-- Controle de duplicidade na entrega
-- Monitoramento de backlog (CloudWatch)
-- Estratégias de retry com backoff
-
-Na abordagem em **row groups**, o sistema trabalha diretamente sobre o arquivo original via **Range GET requests** — sem fila, sem consumers, sem DLQ. Cada worker do `ThreadPoolExecutor` abre sua própria conexão S3 (Range GET para um row group) e sua própria conexão PostgreSQL.
-
-| Componente | SQS por registro | Row Groups streaming |
-|------------|-----------------|---------------------|
-| Mensageria | Fila SQS + DLQ | Nenhuma |
-| Consumers | Lambda ou ECS (auto-scaling) | ThreadPoolExecutor (N workers) |
-| Duplicidade | ID de dedup + lambda idempotente | ON CONFLICT DO NOTHING |
-| Monitoramento | CloudWatch fila + consumer | Logs no terminal |
-| Complexidade total | Alta | Baixa |
-
-### 2. Melhor Eficiência para Cargas Massivas
-
-O PostgreSQL é otimizado para **operações em lote**, não para inserts individuais.
-
-Inserir 1 registro por vez gera:
-
-- N round-trips de rede (1 por linha)
-- N transações (ou 1 transação gigante)
-- N vezes mais CPU no banco
-- N vezes mais WAL (Write Ahead Log)
-
-Nosso fluxo atual:
-
-```
-1.000.000 registros em um Parquet
-
-Row groups (típico: 100k linhas por grupo):
-  ~10 row groups
-  10 Range GET requests
-  10 workers paralelos
-  10 inserts em lote na staging
-
-Merge:
-  Batch upsert de 10.000 em 10.000
-  = 100 transações curtas
-```
-
-O volume de operações no banco é **drasticamente reduzido** — de 1.000.000 inserts individuais para ~100 operações em lote.
-
-### 3. Menor Custo Operacional
-
-Na estratégia SQS por registro:
-
-| Recurso | Impacto |
-|---------|---------|
-| **SQS** | 1.000.000 mensagens por arquivo |
-| **Lambda/ECS** | 1.000.000 invocações |
-| **Rede** | 1.000.000 chamadas de API |
-| **DB connections** | Centenas de connections por minuto |
-| **Logs** | 1.000.000 entradas de log |
-| **Monitoramento** | 1.000.000 métricas de fila |
-
-Na abordagem em row groups:
-
-| Recurso | Impacto |
-|---------|---------|
-| **S3** | 1 head + footer + N Range GETs (N = row groups) |
-| **Threads** | N workers simultâneos (configurável) |
-| **Rede** | N chamadas S3 + poucas chamadas DB |
-| **DB connections** | N connections simultâneas |
-| **Logs** | 1 linha por worker processado |
-| **Monitoramento** | Métricas do próprio script |
-
-O custo está relacionado à **quantidade de row groups** (estrutura interna do Parquet), não à quantidade de registros. Para arquivos grandes, você pode controlar o tamanho dos row groups na geração do Parquet.
-
-### 4. Idempotência Continua Garantida
-
-Uma preocupação comum ao abandonar o modelo de eventos individuais é perder a capacidade de evitar duplicações.
-
-Isso é resolvido através de:
-
-- **`batch_id`**: UUID único por execução do processamento
-- **`source_file`**: identificador do arquivo de origem
-- **`row_number`**: número da linha dentro do arquivo
-- **`record_hash`**: SHA256 dos dados da linha para dedup fino
-- **Constraints únicas** no banco PostgreSQL
-
-```sql
--- Impede o mesmo arquivo+linha de ser inserido duas vezes
-UNIQUE (source_file, row_number)
-
--- Impede o mesmo dado (hash) de ser inserido duas vezes
-UNIQUE (source_file, record_hash)
-```
-
-Se o mesmo arquivo for processado novamente, o PostgreSQL ignora registros já existentes:
-
-```sql
-INSERT INTO custody_position_staging (...)
-VALUES (...)
-ON CONFLICT (source_file, row_number) DO NOTHING
-```
-
-Dessa forma, o processamento permanece seguro e idempotente **sem necessidade de fila**.
-
-### 5. Reprocessamento Continua Possível
-
-Embora não exista uma mensagem SQS para cada linha, ainda é possível reprocessar dados de forma controlada:
-
-| Estratégia | Como fazer |
-|------------|------------|
-| **Reprocessar arquivo inteiro** | Executar `process_file.py` de novo (ON CONFLICT ignora staging duplicada) |
-| **Reprocessar merge** | Executar `merge_staging.py` de novo (só processa PENDING restantes) |
-| **Reprocessar apenas inválidos** | Corrigir dados e gerar novo Parquet com batch_id diferente |
-| **Compensação manual** | UPDATE diretamente na staging com status = 'PENDING' e rodar merge |
-
-No modelo SQS por registro, reprocessar exigiria reenfileirar N mensagens ou implementar um mecanismo de replay na DLQ.
-
-### 6. Tratamento de Erros Mais Simples
-
-Na abordagem SQS, cada falha gera:
-
-1. Mensagem vai para DLQ
-2. Alarme no CloudWatch
-3. Operador precisa investigar
-4. Decidir entre descartar, corrigir e reenfileirar
-5. Se o erro é no dado (não no processamento), a DLQ enche sem solução
-
-Na abordagem em row groups:
-
-- **Registros válidos** → staging (status PENDING)
-- **Registros inválidos** → `custody_position_error` com payload original + motivo
-- **O processamento continua** — um registro inválido não quebra o lote
-
-```
-Exemplo real na POC:
-24 registros processados
-20 válidos → staging
-  4 inválidos → custody_position_error
-    • ACC006/INVL1: quantity is invalid: -100.0
-    • (empty)/INVL2: account_id is empty
-    • ACC007/(empty): asset_id is empty
-    • ACC008/INVL4: amount is invalid: -500.0
-
-Nenhuma fila, nenhuma DLQ, nenhuma interrupção.
-```
-
-### 7. Melhor Auditoria e Rastreabilidade
-
-A tabela de staging cria um **histórico explícito** do processamento:
-
-| Coluna | O que armazena |
-|--------|---------------|
-| `batch_id` | UUID da execução do processamento |
-| `source_file` | s3://bucket/path/arquivo.parquet |
-| `row_number` | Linha exata dentro do arquivo |
-| `record_hash` | SHA256 do conteúdo da linha |
+| `account_id` | VARCHAR | Conta |
+| `asset_id` | VARCHAR | Ativo |
+| `reference_date` | DATE | Data |
+| `quantity` | NUMERIC(18,4) | Quantidade |
+| `amount` | NUMERIC(18,2) | Valor |
+| `updated_at` | TIMESTAMP | Atualização |
+| **UK** | (account_id, asset_id, reference_date) | 1 posição |
+
+### `custody_position_staging`
+| Coluna | Função |
+|--------|--------|
+| `batch_id` | UUID do lote |
+| `source_file` | Origem (s3://...) |
+| `row_number` | Linha no arquivo |
+| `record_hash` | SHA256 do registro |
 | `status` | PENDING → MERGED |
-| `created_at` | Quando foi inserido na staging |
-| `merged_at` | Quando foi integrado à final |
 
-A tabela de erro armazena o `payload` completo em JSONB — cópia fiel do registro que falhou:
+### `custody_position_error`
+| Coluna | Função |
+|--------|--------|
+| `payload` | JSONB com cópia do registro |
+| `error_reason` | Motivo da rejeição |
+| **UK** | (source_file, row_number) |
 
+---
+
+## Idempotência
+
+### Produtor (parquet_to_sqs.py)
+- Cada execução gera um novo `batch_id`
+- Se rodar 2x, envia 2x as mensagens para o SQS
+- Não há proteção contra duplicação no produtor — é proposital
+
+### SQS
+- SQS standard é **at-least-once**: uma mensagem pode chegar 2x ao consumidor
+- O consumidor precisa ser idempotente
+
+### Consumidor (process_sqs_to_db.py)
 ```sql
-SELECT error_reason, payload->>'account_id' AS conta,
-       payload->>'asset_id' AS ativo
-FROM custody_position_error
-WHERE batch_id = '025c8e45-...';
+INSERT INTO staging ... ON CONFLICT (source_file, row_number) DO NOTHING
+```
+- Se a mesma mensagem chegar 2x, o segundo INSERT é ignorado
+- Se o consumidor cai antes de deletar, a mensagem volta em 30s
+  e é reprocessada — `ON CONFLICT` impede duplicação
+- Se o consumidor cai depois de inserir mas antes de deletar,
+  mesma proteção — staging não duplica
+
+### Merge (merge_staging.py)
+- Processa só `status = 'PENDING'`
+- `FOR UPDATE SKIP LOCKED` para concorrência
+- Após merge: `status = 'MERGED'` — não processa de novo
+
+---
+
+## SQS: decisões de design
+
+### Por que enviar TODOS os registros para o SQS (inclusive inválidos)?
+
+A validação poderia acontecer no produtor, enviando só os válidos para a fila.
+Optamos por enviar **todos** porque:
+
+| Motivo | Explicação |
+|--------|------------|
+| **Produtor mais rápido** | Só leitura + serialize + SQS. Sem DB |
+| **Consumidor com lógica completa** | Validação + staging + erro no mesmo lugar |
+| **Rastreabilidade** | Todo registro passou pela fila — mesmo os inválidos |
+| **Desacoplamento** | Produtor não precisa conhecer regras de validação |
+
+O custo: algumas mensagens a mais na fila (os registros inválidos).
+
+### Tamanho do lote SQS
+
+| Operação | Limite SQS | Usado |
+|----------|-----------|-------|
+| `send_message_batch` | 10 mensagens | ✅ 10 |
+| `receive_message` | 10 mensagens | ✅ 10 (configurável) |
+| Mensagem individual | 256 KB | ✅ << 256 KB |
+
+Cada mensagem SQS contém o registro completo em JSON (~200 bytes).
+Muito abaixo do limite de 256 KB.
+
+### Long polling
+
+O consumidor usa `WaitTimeSeconds=5` (long polling):
+- Se a fila está vazia, espera até 5s por novas mensagens
+- Reduz chamadas de API (menos custo)
+- Se após 5s não há mensagens, assume que acabou e encerra
+
+### Visibilidade (Visibility Timeout)
+
+Quando o consumidor recebe uma mensagem, ela fica **invisível** por 30s.
+Se o consumidor não deletar nesse tempo, a mensagem volta para a fila:
+
+```
+Consumidor recebe msg          → invisivel por 30s
+Consumidor insere no DB + COMMIT + deleta msg → OK
+                              ou
+Consumidor CRASHA              → msg volta pra fila em 30s
+                              → outro consumidor processa
 ```
 
-No modelo SQS, a rastreabilidade dependeria de logs do consumer e da mensagem na DLQ — mais difusa e sem estrutura relacional.
+---
 
-### 8. Separação Clara Entre Ingestão e Atualização
+## Comparação: v1 (direto) vs v2 (SQS)
 
-O fluxo divide o pipeline em **duas etapas independentes**:
+| Característica | v1 (process_file.py) | v2 (SQS) |
+|---------------|---------------------|----------|
+| **Leitura** | Streaming de row groups | Streaming de row groups |
+| **Validação** | No mesmo script | No consumidor |
+| **INSERT** | Batch (`execute_values`) | Batch (`execute_values`) |
+| **Acoplamento** | Alto (1 script faz tudo) | Baixo (produtor ≠ consumidor) |
+| **Escalabilidade** | Vertical (mais workers) | Horizontal (mais consumers) |
+| **Buffer de pico** | Sem buffer | Fila SQS |
+| **Custo AWS extra** | Nenhum | SQS (~$0.40/1M msgs) |
+| **Latência** | Menor (direto) | Maior (passa pela fila) |
+| **Complexidade** | Menor | Moderada |
+| **Reprocessamento granular** | Arquivo inteiro | Mensagens individuais |
+| **Consistência** | Imediata | Eventual (delay da fila) |
 
-```
-Etapa 1 — Ingestão (process_file.py)
-──────────────────────────────────────
-  Responsabilidade: baixar, validar, armazenar na staging
-  Pode rodar em janela noturna
-  Não impacta consultas na tabela final
-
-Etapa 2 — Atualização (merge_staging.py)
-──────────────────────────────────────
-  Responsabilidade: aplicar regras de negócio (upsert)
-  Pode rodar após validação da staging
-  Transação curta por lote (não bloqueia)
-```
-
-Essa separação reduz o **acoplamento** e simplifica a **manutenção**. Cada etapa pode evoluir independentemente — por exemplo, a ingestão pode ganhar novos validadores sem afetar o merge, e o merge pode mudar a estratégia de upsert sem revalidar os dados.
-
-### Quando SQS por registro faz sentido
-
-A abordagem baseada em eventos individuais **continua sendo a melhor escolha** quando:
-
-- **Cada registro requer processamento complexo e heterogêneo** (ex: calls a APIs externas, enriquecimento, transformação)
-- **Há integrações externas por registro** (ex: notificar sistema A para ativo X, sistema B para ativo Y)
-- **O tempo de processamento varia significativamente entre mensagens** (ex: 1 registro leva 10ms, outro leva 30s — fila permite escalonamento natural)
-- **Há necessidade de paralelismo extremo com backpressure** (a fila SQS é um buffer natural entre produtor e consumidor)
-- **O sistema é orientado a eventos por design** (outros consumidores reagem a cada registro individualmente)
-
-**Nenhum desses cenários se aplica ao nosso caso**, cujo objetivo é **carga massiva e atualização de dados em banco relacional** com máximo throughput e mínima complexidade.
-
-### Conclusão da Comparação
-
-| Critério | Row Groups (nossa solução) | SQS por registro |
-|----------|---------------------------|------------------|
-| Complexidade arquitetural | Baixa (1 script, 1 worker pool) | Alta (fila, consumer, DLQ, monitoramento) |
-| Throughput no DB | Alto (batch insert) | Baixo (insert individual) |
-| Custo operacional | Previsível (por arquivo) | Proporcional (por registro) |
-| Idempotência | ON CONFLICT DO NOTHING | ID de dedup na fila |
-| Reprocessamento | Simples (reprocessar arquivo) | Complexo (replay de fila) |
-| Tratamento de erros | Tabela de erro + continua lote | DLQ + interrompe lote |
-| Rastreabilidade | Structured (banco relacional) | Difusa (logs + DLQ) |
-| Acoplamento ingestão/atualização | Baixo (separado por script) | Alto (consumer único) |
-| Ideal para | Carga massiva em banco relacional | Processamento heterogêneo por registro |
-
-A solução com row groups mantém características importantes como **idempotência, rastreabilidade e capacidade de reprocessamento**, ao mesmo tempo que evita a complexidade e o custo associados à criação e gerenciamento de milhões de mensagens individuais em filas SQS.
-
+---
 
 ## E se algo der errado?
 
-### Cenário 1: processo morre no meio do download
+### Produtor cai no meio do Parquet
 
 ```
-  Acontece: container cai, falta de memória, timeout de rede
-  Consequência: staging vazia (nenhum row group foi processado)
-  Recuperação: executar process_file.py de novo
-    → Checkpoint detecta que nada foi feito
-    → Reprocessa tudo
+Estado: parte do arquivo foi para SQS
+Recuperacao:
+  • Rodar parquet_to_sqs.py de novo
+  • ON CONFLICT (source_file, row_number) na staging protege duplicatas
+  • SQS terá mensagens duplicadas — mas staging ignora
 ```
 
-### Cenário 2: processo morre no meio do staging
+### Consumidor cai depois de inserir mas antes de deletar
 
 ```
-  Acontece: DB connection drops durante insert de staging
-  Consequência: row group parcialmente inserido
-  Recuperação: executar process_file.py de novo
-    → ON CONFLICT DO NOTHING: linhas já inseridas são ignoradas
-    → Só insere as que faltam
+Estado: dados na staging, mensagem ainda na fila
+Recuperacao:
+  • Visibilidade expira em 30s → mensagem volta pra fila
+  • Outro consumidor (ou o mesmo reiniciado) processa de novo
+  • ON CONFLICT DO NOTHING → staging nao duplica
 ```
 
-### Cenário 3: merge morre no meio
+### SQS fica fora do ar (LocalStack cai)
 
 ```
-  Acontece: deadlock, timeout, conexão perdida
-  Consequência: lote parcialmente mergeado
-    • staging ainda tem registros PENDING (não sofreram UPDATE MERGED)
-  Recuperação: executar merge_staging.py de novo
-    → FOR UPDATE SKIP LOCKED pega só os PENDING restantes
-    → ON CONFLICT DO UPDATE na final = idempotente
+Estado: produtor nao consegue enviar
+Recuperacao:
+  • docker compose restart
+  • Rodar o produtor de novo
+  • Mensagens nao enviadas = processadas de novo do Parquet
 ```
 
-### Cenário 4: merge roda duas vezes (acidentalmente)
+### Consumidor processa mensagem inválida
 
 ```
-  Acontece: schedule duplicado, execução manual + automática
-  Consequência: merge_staging.py roda em paralelo
-    • Worker 1 pega lote A (SKIP LOCKED)
-    • Worker 2 pega lote B (SKIP LOCKED)
-  Resultado: cada lote é processado uma vez
-  Final: sem duplicatas, sem conflitos
+Estado: registro vai para custody_position_error
+Recuperacao:
+  • Corrigir o dado de origem
+  • Regerar Parquet e reprocessar
+  • Ou: UPDATE direto na staging (correção manual)
 ```
-
----
-
-## VACUUM
-
-### O que é?
-
-VACUUM é um comando do PostgreSQL que **recupera espaço ocupado por registros mortos (dead tuples)**.
-
-### Por que precisa?
-
-O PostgreSQL usa **MVCC (Multi-Version Concurrency Control)**. Quando você faz um UPDATE, o PostgreSQL não modifica o registro original — ele cria uma **nova versão** (nova tupla) e marca a antiga como **morta (dead tuple)**. Com o tempo:
-
-```
-Antes do UPDATE:
-  [PETR4, qty=1000]  ← tupla viva
-
-Depois do UPDATE (qty=1500):
-  [PETR4, qty=1000]  ← dead tuple (ocupando espaço)
-  [PETR4, qty=1500]  ← tupla viva
-```
-
-Sem VACUUM:
-- A tabela cresce infinitamente (table bloat)
-- As queries ficam mais lentas (precisam escanear mais páginas)
-- Indexes também incham
-- Pode estourar o disk space
-
-### Tipos de VACUUM
-
-```sql
--- VACUUM padrão: marca espaço como reutilizável (não libera para o SO)
-VACUUM custody_position;
-
--- VACUUM ANALYZE: VACUUM + atualiza estatísticas para o planner
-VACUUM ANALYZE custody_position;
-
--- VACUUM FULL: libera espaço para o SO (bloqueia a tabela!)
-VACUUM FULL custody_position;
-
--- AUTO VACUUM: o PostgreSQL faz automaticamente, mas pode não acompanhar
-```
-
-### Quando executar
-
-```bash
-# Após cada merge grande (recomendado)
-docker exec poc-postgres psql -U pocuser -d pocdb -c "VACUUM ANALYZE custody_position"
-
-# Verificar bloat
-docker exec poc-postgres psql -U pocuser -d pocdb -c "
-SELECT schemaname, relname, n_dead_tup, n_live_tup,
-       round(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 2) AS dead_pct
-FROM pg_stat_user_tables
-WHERE relname = 'custody_position';
-"
-```
-
-> ⚠️ **AVISO**: `VACUUM FULL` é exclusivo e bloqueia a tabela. Use apenas em janelas de manutenção. O `VACUUM` padrão (sem FULL) roda concorrentemente com leituras e escritas.
-
-> 💡 **Nota para RDS Aurora PostgreSQL**: O **Aurora gerencia o storage de forma distribuída** e o **autovacuum** já vem habilitado e configurado pela AWS com parâmetros adequados no `DB cluster parameter group`. Em produção com Aurora, você **não precisa se preocupar com VACUUM manual** — o serviço cuida disso automaticamente. O entendimento conceitual de dead tuples continua importante para dimensionamento e modelagem, mas a operação é transparente.
-
----
-
-## Particionamento
-
-### O que é?
-
-Particionamento divide uma tabela grande em **partições menores** baseadas em uma coluna-chave (ex: `reference_date`). O PostgreSQL roteia automaticamente cada registro para a partição correta.
-
-### Quando considerar
-
-```
-Tamanho da tabela        Recomendação
-────────────────────     ────────────────────
-< 10 milhões             Sem particionamento (overhead desnecessário)
-10-50 milhões            Avaliar particionamento mensal
-50+ milhões              Particionamento recomendado
-```
-
-### Exemplo para `custody_position`
-
-```sql
--- Tabela particionada por mês (reference_date)
-CREATE TABLE custody_position (
-    id SERIAL,
-    account_id VARCHAR NOT NULL,
-    asset_id VARCHAR NOT NULL,
-    reference_date DATE NOT NULL,
-    quantity NUMERIC(18, 4) NOT NULL,
-    amount NUMERIC(18, 2) NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id, reference_date)  -- PK precisa incluir a coluna de partição
-) PARTITION BY RANGE (reference_date);
-
--- Partições mensais
-CREATE TABLE custody_position_2025_01 PARTITION OF custody_position
-    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
-
-CREATE TABLE custody_position_2025_02 PARTITION OF custody_position
-    FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
-
-CREATE TABLE custody_position_default PARTITION OF custody_position DEFAULT;
-```
-
-### Benefícios
-
-| Benefício | Explicação |
-|-----------|------------|
-| **Manutenção eficiente** | Drop de partição antiga é instantâneo (sem DELETE milhões de linhas) |
-| **Query mais rápida** | PostgreSQL só escaneia as partições necessárias (partition pruning) |
-| **Paralelismo** | Cada partição pode ser vacuum/indexada independentemente |
-| **Archiving** | Partições antigas podem ser movidas para storage mais barato |
-
-### Cuidados
-
-| Cuidado | Por quê |
-|---------|---------|
-| PK precisa incluir a coluna de partição | Limitação do PostgreSQL |
-| Constraints únicas entre partições não são possíveis | Cada partição tem seu próprio índice único |
-| Migração requer rebuild | `CREATE TABLE ... PARTITION BY RANGE` + `INSERT INTO ... SELECT` |
-
----
-
-## MiniStack / LocalStack
-
-Este projeto utiliza a imagem `localstack/localstack:latest` com `SERVICES=s3` como emulador S3
-compatível com MiniStack (modo gratuito). O LocalStack Community Edition é gratuito e oferece
-o serviço S3 sem necessidade de licença, chave AWS ou conta.
-
-Para usar o MiniStack oficial, altere a imagem no `docker-compose.yml` para
-`ministackorg/ministack:latest` (se disponível) e ajuste as configurações conforme documentação.
 
 ---
 
 ## Troubleshooting
 
-| Problema | Causa provável | Solução |
-|----------|---------------|---------|
-| `Connection refused` no S3 | LocalStack não está pronto | `docker compose ps` — aguarde "healthy" |
-| `Connection refused` no PostgreSQL | PostgreSQL não está pronto | `docker compose ps` — aguarde "healthy" |
-| `MultiPartUpload` ou `BucketAlreadyOwnedByYou` | Bucket já existe | Normal — o script trata como aviso |
-| `NoSuchBucket` no processamento | Bucket foi recriado | Execute `upload_to_s3.py` novamente |
-| `pyarrow` não instalou | Dependência faltando | `pip install pyarrow` separadamente |
-| Tabelas não existem | Volume PostgreSQL foi removido | `docker compose down -v && docker compose up -d` |
-| Merge lento | Batch size muito pequeno | Ajuste `MERGE_BATCH_SIZE=50000` |
-| Erro `seek` no S3 | StreamingBody não seekable | (já corrigido na versão atual com BytesIO) |
-| Table bloat suspeito | Muitos dead tuples | `VACUUM ANALYZE custody_position` |
-
----
-
-## Consultas úteis
-
-```bash
-# Acessar o banco
-docker exec -it poc-postgres psql -U pocuser -d pocdb
-
-# Tabela final — todos os registros
-SELECT * FROM custody_position ORDER BY account_id, asset_id, reference_date;
-
-# Staging — status dos lotes
-SELECT batch_id, status, COUNT(*) AS registros
-FROM custody_position_staging
-GROUP BY batch_id, status
-ORDER BY batch_id;
-
-# Erros por lote
-SELECT e.batch_id, e.error_reason, COUNT(*) AS ocorrencias
-FROM custody_position_error e
-GROUP BY e.batch_id, e.error_reason
-ORDER BY e.batch_id;
-
-# Data de atualização dos registros na final
-SELECT account_id, asset_id, quantity, updated_at
-FROM custody_position
-WHERE updated_at > NOW() - INTERVAL '1 hour';
-```
+| Problema | Causa | Solução |
+|----------|-------|---------|
+| SQS queue não existe | Primeira execução | `parquet_to_sqs.py` cria automaticamente |
+| Consumer não pega mensagens | Fila vazia ou produtor não rodou | Execute o produtor primeiro |
+| `Connection refused` no SQS | LocalStack sem SQS | `docker compose up -d` recria o container |
+| Mensagens voltando para fila | Consumer lento ou crashou | Aumente `VISIBILITY_TIMEOUT` |
+| Dados duplicados na staging | Mensagem entregue 2x | ON CONFLICT DO NOTHING protege — verifique se está ativo |
+| Merge não processa staging | Status não é PENDING | `WHERE status = 'PENDING'` — verifique o status |
