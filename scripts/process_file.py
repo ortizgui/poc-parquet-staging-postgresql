@@ -140,52 +140,27 @@ def process_row_group(
                     result["invalid"] += 1
             else:
                 record_hash = compute_record_hash(row)
-                # DB insert with savepoint isolation:
-                # If this specific row fails (e.g., numeric overflow, type mismatch),
-                # the savepoint rollback undoes only this row — other rows in the
-                # same row group are NOT affected and continue processing.
-                sp_name = f"sp_{rg_idx}_{row_number}"
-                try:
-                    cur.execute(f"SAVEPOINT {sp_name}")
-                    cur.execute(
-                        """
-                        INSERT INTO custody_position_staging
-                            (batch_id, source_file, row_number, record_hash,
-                             account_id, asset_id, reference_date, quantity, amount)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (source_file, row_number) DO NOTHING
-                        """,
-                        (
-                            str(batch_id), source_file, row_number, record_hash,
-                            row["account_id"], row["asset_id"],
-                            row["reference_date"].to_pydatetime()
-                                if hasattr(row["reference_date"], "to_pydatetime")
-                                else row["reference_date"],
-                            row["quantity"], row["amount"],
-                        ),
-                    )
-                    affected = cur.rowcount  # capture BEFORE RELEASE (which resets rowcount)
-                    cur.execute(f"RELEASE SAVEPOINT {sp_name}")
-                    if affected > 0:
-                        result["valid"] += 1
-                    else:
-                        result["duplicate"] += 1
-                except Exception as e:
-                    # DB error on this specific row → rollback savepoint
-                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
-                    # Log the failed row to error table with DB error detail
-                    payload["error_detail"] = str(e)
-                    cur.execute(
-                        """
-                        INSERT INTO custody_position_error
-                            (batch_id, source_file, row_number, payload, error_reason)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (source_file, row_number) DO NOTHING
-                        """,
-                        (str(batch_id), source_file, row_number,
-                         json.dumps(payload), f"DB error: {e}"),
-                    )
-                    result["invalid"] += 1
+                cur.execute(
+                    """
+                    INSERT INTO custody_position_staging
+                        (batch_id, source_file, row_number, record_hash,
+                         account_id, asset_id, reference_date, quantity, amount)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (source_file, row_number) DO NOTHING
+                    """,
+                    (
+                        str(batch_id), source_file, row_number, record_hash,
+                        row["account_id"], row["asset_id"],
+                        row["reference_date"].to_pydatetime()
+                            if hasattr(row["reference_date"], "to_pydatetime")
+                            else row["reference_date"],
+                        row["quantity"], row["amount"],
+                    ),
+                )
+                if cur.rowcount > 0:
+                    result["valid"] += 1
+                else:
+                    result["duplicate"] += 1
 
         conn.commit()
 
