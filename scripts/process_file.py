@@ -128,10 +128,16 @@ def process_row_group(
         df = table.to_pandas()
         result["rows"] = len(df)
 
-        # --- 2. Validation loop + build batch lists ---
-        #     Percorre as N linhas UMA vez (O(N), inevitavel).
-        #     Acumula tuplas para INSERT em batch ao inves de
-        #     N inserts individuais.
+        # ──────────────────────────────────────────────────────────────
+        #  PASSO 2: VALIDA TODAS AS LINHAS (1 loop, O(N))
+        # ──────────────────────────────────────────────────────────────
+        #  Para CADA linha: valida em Python, decide destino.
+        #  NAO insere ainda — só acumula em listas de tuplas.
+        #
+        #  Ex: 5000 linhas → 5000 validacoes (inevitavel)
+        #      4980 validas → valid_rows.append(...)
+        #      20 invalidas → invalid_rows.append(...)
+        # ──────────────────────────────────────────────────────────────
         valid_rows: list[tuple] = []
         invalid_rows: list[tuple] = []
 
@@ -164,7 +170,18 @@ def process_row_group(
                     ref_date, row["quantity"], row["amount"],
                 ))
 
-        # --- 3. Batch INSERT valid rows (1 statement, N rows) ---
+        # ──────────────────────────────────────────────────────────────
+        #  PASSO 3: INSERT EM BATCH — VALIDAS (1 statement)
+        # ──────────────────────────────────────────────────────────────
+        #  execute_values() monta UM unico INSERT com TODAS as tuplas:
+        #
+        #    INSERT INTO staging VALUES (linha1), (linha2), ..., (linhaN)
+        #    ON CONFLICT DO NOTHING
+        #
+        #  Em vez de 5000 INSERTs individuais, fazemos 1 so.
+        #  cur.rowcount = quantas foram realmente inseridas
+        #  (ON CONFLICT ignora duplicatas, nao as conta)
+        # ──────────────────────────────────────────────────────────────
         if valid_rows:
             execute_values(cur, """
                 INSERT INTO custody_position_staging
@@ -176,7 +193,15 @@ def process_row_group(
             result["valid"] = cur.rowcount
             result["duplicate"] = len(valid_rows) - cur.rowcount
 
-        # --- 4. Batch INSERT invalid rows (1 statement, N rows) ---
+        # ──────────────────────────────────────────────────────────────
+        #  PASSO 4: INSERT EM BATCH — INVALIDAS (1 statement)
+        # ──────────────────────────────────────────────────────────────
+        #  Mesma logica: 1 INSERT com todas as linhas invalidas.
+        #
+        #  Total de statements no DB para 5000 linhas:
+        #    2 (1 validas + 1 invalidas)
+        #  Antes (sem batch): 5000 statements
+        # ──────────────────────────────────────────────────────────────
         if invalid_rows:
             execute_values(cur, """
                 INSERT INTO custody_position_error
