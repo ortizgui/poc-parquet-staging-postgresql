@@ -1,186 +1,457 @@
-# POC — Batch Processing Parquet → PostgreSQL
+# POC — Processamento Batch de Parquet → PostgreSQL
 
-Prova de conceito de um pipeline de processamento batch de arquivos Parquet armazenados em S3 (emulado via LocalStack) para PostgreSQL, usando uma tabela de staging com validação por chunks e merge idempotente na tabela final.
-
-## Visão Geral
-
-1. **Docker Compose** sobe PostgreSQL 16 e LocalStack (S3 emulator).
-2. **Script Python** gera um arquivo Parquet com ~25 registros (incluindo válidos, updates e inválidos).
-3. **Upload** do arquivo para o bucket S3 local.
-4. **Processamento via streaming de row groups**: 
-   - **Metadata first**: apenas o footer do Parquet é baixado via Range request para ler a estrutura de row groups
-   - **Streaming paralelo**: cada row group é baixado sob demanda por um worker independente (cada um com sua própria conexão S3 via Range requests e conexão PostgreSQL)
-   - **Validação**: cada worker valida suas linhas, insere válidos na staging e inválidos na tabela de erro
-   - **Checkpoint implícito**: se o processo for interrompido e retomado, row groups já processados são detectados via `ON CONFLICT DO NOTHING` e ignorados
-5. **Merge em lotes** (batch merge): processa registros pendentes da staging em lotes de 10.000 (configurável via `MERGE_BATCH_SIZE`). Cada lote:
-   - **Passo 1**: insere na tabela final apenas registros que **não existem** (`WHERE NOT EXISTS`)
-   - **Passo 2**: atualiza na tabela final registros que **já existem** (`UPDATE via JOIN`)
-   - **Passo 3**: marca o lote como `MERGED` na staging
-   - Cada lote é uma transação independente — evita transação monolithic
-
-## Estrutura do Projeto
+Prova de conceito de um pipeline batch que lê arquivos Parquet do S3, valida registros em paralelo, insere em staging e faz merge upsert na tabela final — tudo rodando localmente com Docker.
 
 ```
-.
-├── docker-compose.yml
-├── .env
-├── requirements.txt
-├── README.md
-├── data/input/
-├── scripts/
-│   ├── create_sample_file.py
-│   ├── upload_to_s3.py
-│   ├── process_file.py
-│   └── merge_staging.py
-└── sql/
-    ├── 001_init.sql
-    └── 002_seed_final.sql
+┌─────────────────────────────────────────────────────────────────────┐
+│                    PIPELINE DE PROCESSAMENTO BATCH                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  S3 (MiniStack)                                                      │
+│  ┌──────────────────┐            ┌──────────────────────────────┐   │
+│  │ custody_position │  Range    │  Python: process_file.py      │   │
+│  │   .parquet       │──GET────▶│  ┌──────────────────────────┐ │   │
+│  │   (24 linhas)    │           │  │ 1. Lê footer (metadata) │ │   │
+│  └──────────────────┘           │  │ 2. Worker pool:         │ │   │
+│       ▲                         │  │    ├─ Worker 1 → RG 0   │ │   │
+│       │ upload                  │  │    ├─ Worker 2 → RG 1   │ │   │
+│  ┌────┴───────────┐             │  │    └─ Worker N → RG N   │ │   │
+│  │ create_sample  │             │  │ 3. Valida cada linha    │ │   │
+│  │ _file.py       │             │  │ 4. Válido → staging     │ │   │
+│  └────────────────┘             │  │ 5. Inválido → erro      │ │   │
+│                                 └──┼───────────────────────────┘   │
+│                                    │                               │
+│           ┌────────────────────────┼───────────────────┐           │
+│           │                        ▼                   │           │
+│           │     ┌──────────────────────────────────┐   │           │
+│           │     │     PostgreSQL (pocdb)            │   │           │
+│           │     │                                  │   │           │
+│           │     │  ┌──────────────────────────┐   │   │           │
+│           │     │  │ custody_position_error   │   │   │           │
+│     merge │     │  │ (registros inválidos)    │   │   │           │
+│     staging.py  │  └──────────────────────────┘   │   │           │
+│           │     │                                  │   │           │
+│           │     │  ┌──────────────────────────┐   │   │           │
+│           └─────│▶│ custody_position_staging  │───┘   │           │
+│                 │  │ (PENDING → MERGED)       │       │           │
+│                 │  └──────────┬───────────────┘       │           │
+│                 │             │ upsert (batch)         │           │
+│                 │             ▼                        │           │
+│                 │  ┌──────────────────────────┐   │   │           │
+│                 │  │ custody_position (final) │   │   │           │
+│                 │  │ (3 seed + 17 novos)      │   │   │           │
+│                 │  └──────────────────────────┘   │   │           │
+│                 └──────────────────────────────────┘   │           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Índice
+
+1. [Problema de negócio](#problema-de-negócio)
+2. [Por que esta arquitetura?](#por-que-esta-arquitetura)
+3. [Stack tecnológica](#stack-tecnológica)
+4. [Pré-requisitos](#pré-requisitos)
+5. [Setup do ambiente](#setup-do-ambiente)
+6. [Execução do pipeline](#execução-do-pipeline)
+7. [O papel de cada tabela](#o-papel-de-cada-tabela)
+8. [Idempotência: camada por camada](#idempotência-camada-por-camada)
+9. [Decisões de arquitetura](#decisões-de-arquitetura)
+10. [E se algo der errado?](#e-se-algo-der-errado)
+11. [VACUUM](#vacuum)
+12. [Particionamento](#particionamento)
+13. [MiniStack / LocalStack](#ministack--localstack)
+14. [Troubleshooting](#troubleshooting)
+
+---
+
+## Problema de negócio
+
+Instituições financeiras precisam processar diariamente **arquivos de posição de custódia** vindos de fontes externas (B3, custodiantes, administradores fiduciários). Estes arquivos contêm:
+
+- **Registros novos**: ativos que entraram na carteira do cliente
+- **Registros de atualização**: mesma posição do dia anterior, mas com saldo diferente
+- **Registros inválidos**: dados inconsistentes que precisam ser reportados sem quebrar o fluxo
+
+### Requisitos críticos
+
+| Requisito | Por quê |
+|-----------|---------|
+| **Não perder dados** | Cada registro representa dinheiro real de clientes |
+| **Idempotência** | Reprocessar o mesmo arquivo não pode gerar duplicatas |
+| **Rastreabilidade** | Saber exatamente qual lote originou cada registro |
+| **Isolamento** | Dados em processamento não podem poluir a tabela final |
+| **Escalabilidade** | O mesmo design precisa funcionar para 24 ou 24 milhões de linhas |
+| **Custo zero de licença** | Tudo open source, sem dependência de AWS real |
+
+---
+
+## Por que esta arquitetura?
+
+### O fluxo em alto nível
+
+```
+ARQUIVO BRUTO              ÁREA DE PREPARAÇÃO              DADO CONFIÁVEL
+─────────────────      ────────────────────────        ─────────────────
+S3 (Parquet) ──────▶  custody_position_staging ──────▶  custody_position
+                      (validação + batch_id)            (final, consistente)
+                             │
+                             └─▶ custody_position_error
+                                 (diagnóstico)
+```
+
+Cada etapa tem uma responsabilidade única e isolada:
+
+### 1. Staging — por que não inserir direto na final?
+
+A staging existe como **área de preparação (buffer)** entre o dado bruto e o dado confiável:
+
+```
+SEM STAGING:                     COM STAGING:
+─────                            ─────
+S3 → Tabela Final                S3 → Staging → Merge → Final
+                                  │
+Se o processo morre no meio:      Se o merge morre:
+  Metade dos dados na final       Staging intacta (PENDING)
+  Sem saber o que já entrou       Reprocessa merge, não o download
+  Precisa truncar e recomeçar     Dados brutos preservados na staging
+
+Staging também permite:
+  • Auditoria: batch_id, source_file, row_number por registro
+  • Validação antes de expor à consulta
+  • Rollback sem truncar tabela final
+  • Reprocessamento seletivo (só o merge)
+```
+
+### 2. Batch merge — por que não um upsert gigante?
+
+Um único `INSERT ... ON CONFLICT DO UPDATE` para milhões de linhas é uma **transação monolithic**:
+
+```
+Monolithic (ruim):                   Batch (bom):
+─────────────────                    ────────────
+BEGIN;                               BEGIN;  -- lote 1/100
+  INSERT 10M linhas ON CONFLICT        INSERT WHERE NOT EXISTS
+COMMIT; -- 45 minutos                  UPDATE via JOIN
+                                       COMMIT; -- 3 segundos
+Riscos:                               BEGIN;  -- lote 2/100
+  • Lock na tabela final por horas      ...
+  • WAL de 50 GB no disco            Se lote 5 falha:
+  • Rollback desfaz TUDO               • Só lote 5 perdeu
+  • max_locks_per_transaction          • Lotes 1-4 já comitaram
+                                       • Reprocessa só lote 5
+```
+
+### 3. Streaming de row groups — por que não baixar o arquivo inteiro?
+
+Arquivos Parquet são divididos internamente em **Row Groups** (grupos de linhas). Cada Row Group tem seus próprios dados e metadados:
+
+```
+Arquivo Parquet:
+┌──────────────────────────────────────────────────────────┐
+│ Magic │ Row Group 0  │ Row Group 1 │ ... │ Row Group N │ Footer │
+│Bytes  │ (10k linhas) │ (10k linhas)│     │ (10k linhas)│(meta)  │
+└──────────────────────────────────────────────────────────┘
+         ▲              ▲                   ▲
+         │              │                   │
+    Worker 1       Worker 2            Worker N
+    (Range GET)    (Range GET)         (Range GET)
+```
+
+Cada Worker baixa **apenas o que precisa** via Range GET — uma requisição HTTP que pede bytes específicos do arquivo. Sem download do arquivo inteiro. Sem estourar RAM.
+
+---
+
+## Stack tecnológica
+
+| Componente | Tecnologia | Versão | Função |
+|------------|-----------|--------|--------|
+| Container | Docker Compose | - | Orquestração dos serviços |
+| S3 emulator | LocalStack (MiniStack-compatível) | latest | Simula S3 sem conta AWS |
+| Banco relacional | PostgreSQL | 16 | Armazenamento relacional |
+| Streaming S3 | s3fs / fsspec | 2026.6+ | Leitura de Parquet via Range GET |
+| Parquet | pyarrow | 17+ | Leitura de row groups |
+| DataFrame | pandas | 2.2+ | Validação por linha |
+| S3 SDK | boto3 | 1.34+ | Upload/download S3 |
+| DB driver | psycopg2-binary | 2.9+ | Conexão PostgreSQL |
+| Parquet generation | pyarrow + pandas | - | Criação do arquivo de exemplo |
+
+---
 
 ## Pré-requisitos
 
-- Docker e Docker Compose
-- Python 3.12+
-- `pip` / `venv`
+- **Docker** e **Docker Compose** (para PostgreSQL e LocalStack)
+- **Python 3.12+** (para os scripts)
+- ~2 GB de RAM livre
+- ~5 GB de disco livre
 
-## Setup do Ambiente
+---
+
+## Setup do ambiente
 
 ```bash
-# Subir ambiente (PostgreSQL + LocalStack)
+# 1. Subir os serviços (PostgreSQL + LocalStack)
 docker compose up -d
 
-# Aguardar serviços ficarem prontos
+# 2. Verificar se estão saudáveis
 docker compose ps
+# Esperado: ambos com status "healthy"
 
-# Criar ambiente Python
+# 3. Criar ambiente Python e instalar dependências
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Execução do Pipeline
+---
+
+## Execução do pipeline
 
 ```bash
-# Gerar arquivo Parquet (~24 registros)
+# Etapa 1 — Gerar arquivo Parquet de exemplo (24 registros)
 python scripts/create_sample_file.py
+# Output:
+#   Arquivo gerado: ./data/input/custody_position.parquet
+#   Linhas: 24
 
-# Enviar para S3 local
+# Etapa 2 — Enviar para o S3 local (MiniStack/LocalStack)
 python scripts/upload_to_s3.py
+# Output:
+#   Bucket criado: poc-bucket
+#   Arquivo enviado: s3://poc-bucket/input/custody_position.parquet
 
-# Processar arquivo em chunks (valida + staging)
-python scripts/process_file.py --bucket poc-bucket --key input/custody_position.parquet --chunk-size 5
+# Etapa 3 — Processar em streaming paralelo
+python scripts/process_file.py --bucket poc-bucket \
+                               --key input/custody_position.parquet \
+                               --chunk-size 5
+# Output:
+#   batch_id: 025c8e45-...
+#   Total linhas: 24 | Row groups: 1
+#   Row groups pendentes: 1/1
+#   RG  0: 20 validos, 4 invalidos, 0 duplicatas, 24 linhas
+#   Resumo: 20 validos, 4 invalidos
 
-# Executar merge para tabela final (batch merge)
+# Etapa 4 — Merge para tabela final (batch upsert)
 python scripts/merge_staging.py
+# Output:
+#   Registros pendentes antes: 20
+#   Lote 10/20: +7 novos / ~10 atualizados
+#   Lote 20/20: +10 novos / ~10 atualizados
+#   Total final na custody_position: 20
 
-# Opcional: configurar tamanho do lote
+# Opcional: configurar batch size do merge
 MERGE_BATCH_SIZE=5000 python scripts/merge_staging.py
+
+# Opcional: configurar workers de processamento
+PROCESS_MAX_WORKERS=8 python scripts/process_file.py ...
 ```
-
-## Consultas úteis no PostgreSQL
-
-```bash
-# Acessar o banco
-docker exec -it poc-postgres psql -U pocuser -d pocdb
-
-# Ver tabela final
-SELECT * FROM custody_position ORDER BY account_id, asset_id, reference_date;
-
-# Ver staging
-SELECT status, COUNT(*) FROM custody_position_staging GROUP BY status;
-
-# Ver erros
-SELECT * FROM custody_position_error;
-```
-
-## Notas sobre Idempotência
-
-- **`create_sample_file.py`**: sempre sobrescreve o mesmo arquivo — seguro reexecutar.
-- **`upload_to_s3.py`**: sobrescreve o objeto no S3 — seguro reexecutar.
-- **`process_file.py`**: cada execução gera um novo `batch_id`. As constraints `UNIQUE (source_file, row_number)` e `UNIQUE (source_file, record_hash)` impedem duplicação de registros. Registros já inseridos são ignorados com `ON CONFLICT DO NOTHING`.
-- **`merge_staging.py`**: processa apenas registros com `status = 'PENDING'`. Após o merge, o status muda para `'MERGED'`. Reexecutar não reprocessa registros já mergeados. O `FOR UPDATE SKIP LOCKED` garante que cada lote seja processado por apenas um worker.
 
 ---
 
-## Arquitetura para Produção
+## O papel de cada tabela
 
-### Por que processamento via streaming de row groups (não o arquivo inteiro)?
+### `custody_position` (tabela final)
 
-A primeira versão desta POC baixava o **arquivo Parquet inteiro** para a memória antes de processar:
+A tabela "fonte da verdade". Contém apenas **dados consistentes** e prontos para consulta.
 
-```python
-# ANTIGO: arquivo inteiro na RAM
-resp = s3.get_object(Bucket=bucket, Key=key)
-df = pd.read_parquet(io.BytesIO(resp["Body"].read()))
-```
+| Coluna | Tipo | Função |
+|--------|------|--------|
+| `account_id` | VARCHAR | Identificador da conta (ex: ACC001) |
+| `asset_id` | VARCHAR | Código do ativo (ex: PETR4) |
+| `reference_date` | DATE | Data de referência da posição |
+| `quantity` | NUMERIC(18,4) | Quantidade do ativo |
+| `amount` | NUMERIC(18,2) | Valor financeiro |
+| `updated_at` | TIMESTAMP | Última atualização |
+| **UK** | (account_id, asset_id, reference_date) | Garante 1 registro por posição |
 
-Para milhões de registros, isso é inviável:
-- Um Parquet de 10M registros ≈ 200 MB a 1 GB
-- Não escala horizontalmente (single-thread, memória única)
-- Se o processo morre no meio, tudo é perdido
+### `custody_position_staging` (área de staging)
 
-A nova versão usa **streaming de row groups** via `s3fs` (Range GET requests):
+Recebe os dados crus do processamento. Cada lote é identificado por `batch_id`. Depois do merge, os registros mudam de `PENDING` para `MERGED`.
 
-```python
-# NOVO: streaming row group a row group
-with fs.open(s3_path, 'rb') as f:
-    pf = pq.ParquetFile(f)           # só lê o footer (Range request, ~KB)
-    for rg_idx in range(pf.metadata.num_row_groups):
-        table = pf.read_row_group(rg_idx)  # Range request por row group
-```
+| Coluna | Tipo | Função |
+|--------|------|--------|
+| `batch_id` | UUID | Identificador único do processamento |
+| `source_file` | VARCHAR | Origem do dado (ex: s3://...) |
+| `row_number` | INTEGER | Número da linha no arquivo original |
+| `record_hash` | VARCHAR | SHA256 dos dados (dedup adicional) |
+| `status` | VARCHAR | PENDING → MERGED |
+| `merged_at` | TIMESTAMP | Quando foi integrado à final |
+| **UK1** | (source_file, row_number) | Impede duplicata do mesmo arquivo |
+| **UK2** | (source_file, record_hash) | Impede duplicata do mesmo dado |
 
-```
-Download:  [Footer (KB)]─────[RG 0]─────[RG 1]─────[RG 2]─────...
-           │                 │         │         │
-           │             Worker 1   Worker 2   Worker 3
-           │             (thread)  (thread)  (thread)
-           │                 │         │         │
-Memória:   ~KB             ~batch    ~batch    ~batch
-```
+### `custody_position_error` (diagnóstico)
 
-Cada worker:
-- Abre sua própria conexão S3 (Range request para UM row group)
-- Abre sua própria conexão PostgreSQL
-- Processa apenas seu row group
-- Não depende de outros workers
+Registros que falharam validação. Permite auditoria sem travar o pipeline.
 
-Se um worker falha, só o row group dele precisa ser reprocessado.
+| Coluna | Tipo | Função |
+|--------|------|--------|
+| `batch_id` | UUID | Lote que detectou o erro |
+| `payload` | JSONB | Cópia fiel do registro original |
+| `error_reason` | TEXT | Motivo da rejeição (ex: "account_id is empty") |
+| **UK** | (source_file, row_number) | Impede erro duplicado no reprocessamento |
 
-### Por que merge em lotes (batch merge)?
+---
 
-O merge monolithic (única transação com milhões de registros) tem problemas graves em produção:
+## Idempotência: camada por camada
 
-| Problema | Impacto |
-|----------|---------|
-| Transação gigante | Bloqueia a tabela final por minutos/horas |
-| `max_locks_per_transaction` | Pode estourar o limite de locks do PostgreSQL |
-| WAL enorme | Geração excessiva de Write-Ahead Log |
-| Rollback catastrófico | Se falha no final, tudo é desfeito — horas perdidas |
-
-O **batch merge** resolve isso:
-- Cada lote de N registros (ex: 10.000) é uma transação curta
-- Se um lote falha, só ele precisa ser reprocessado
-- Vários workers podem processar lotes em paralelo
-- A tabela final fica bloqueada por milissegundos, não horas
-
-### Por que dois passos (INSERT + UPDATE separados) em vez de `ON CONFLICT DO UPDATE`?
+Idempotência significa que **executar a mesma operação N vezes produz o mesmo resultado que executar 1 vez**.
 
 ```
-Abordagem original (ON CONFLICT DO UPDATE):
-  INSERT 1.000.000 linhas
-  ON CONFLICT (chave) DO UPDATE SET quantity = EXCLUDED.quantity
-  → Gera dead tuple para CADA linha existente atualizada
-  → Table bloat na tabela final
+Camada 1 — process_file.py (download + staging)
+───────────────────────────────────────────────
+  Execução 1: baixa Parquet, insere 20 registros na staging
+  Execução 2: baixa Parquet mesmo arquivo
+    → ON CONFLICT (source_file, row_number) DO NOTHING
+    → 0 novos registros (20 ignorados como duplicatas)
+  Resultado: staging com 20 registros (não 40)
 
-Abordagem em dois passos:
-  Passo 1: INSERT WHERE NOT EXISTS
-  Passo 2: UPDATE via JOIN
-  → Menos dead tuples (só o UPDATE gera)
-  → Mais previsível para o planner do PostgreSQL
-  → Permite VACUUM entre os passos se necessário
+Camada 2 — merge_staging.py (staging → final)
+───────────────────────────────────────────────
+  Execução 1: 20 PENDING → INSERT + UPDATE na final → marca MERGED
+  Execução 2: 0 PENDING (já foram mergeados)
+    → WHERE status = 'PENDING' retorna vazio
+    → Nada acontece
+  Resultado: final com 20 registros (não 40)
+
+Camada 3 — reprocessamento completo
+───────────────────────────────────────────────
+  process_file.py + merge_staging.py (de novo):
+  • Staging: registros ignorados (já existem)
+  • Merge: staging sem PENDING → nada a fazer
+  • Final: inalterada
 ```
 
-Na prática, para milhões de registros o `ON CONFLICT DO UPDATE` funciona bem — a diferença é sutil. O que realmente importa é o **batch** (evitar transação monolithic). O dois-passos é uma camada extra de segurança e clareza.
+---
+
+## Decisões de arquitetura
+
+### 1. Por que `s3fs` em vez de `boto3` + `BytesIO`?
+
+```
+Critério              boto3 + BytesIO         s3fs (Range GET)
+──────────────────  ──────────────────────   ─────────────────────
+Download            Arquivo inteiro           Só o que precisa
+RAM                 Tamanho do arquivo        Tamanho do row group
+Paralelismo         Não (1 conexão)           Sim (N workers)
+Range request       Manual (Range header)     Automático (fsspec)
+Checkpoint          Requer lógica extra       ON CONFLICT + MAX()
+```
+
+`s3fs` abstrai Range GET requests e permite que o `pyarrow.ParquetFile` leia apenas os bytes necessários do S3 — sem baixar nada além do necessário.
+
+### 2. Por que `ThreadPoolExecutor` em vez de `multiprocessing`?
+
+| Característica | ThreadPoolExecutor | multiprocessing |
+|----------------|-------------------|-----------------|
+| Uso de CPU | Leve (I/O bound) | Pesado (CPU bound) |
+| Memória | Compartilhada | Duplicada (N×RAM) |
+| Complexidade | Baixa | Alta (pickle, serialização) |
+| Ideal para | Download + DB I/O | Processamento computacional |
+
+Nosso gargalo é **I/O** (download S3 + insert PostgreSQL), não CPU. Threads são a escolha correta.
+
+### 3. Por que `ON CONFLICT DO NOTHING` em vez de verificar antes?
+
+```sql
+-- Abordagem "check-then-insert" (NÂO use em concorrência)
+SELECT COUNT(*) FROM staging WHERE source_file = 'x' AND row_number = 5
+-- Se não existe:
+INSERT INTO staging ...
+
+-- Abordagem "insert-or-ignore" (correta)
+INSERT INTO staging ... ON CONFLICT (source_file, row_number) DO NOTHING
+-- Se já existe, ignora silenciosamente
+```
+
+`ON CONFLICT DO NOTHING` é **atômico**: não há janela entre o check e o insert onde outra thread pode inserir o mesmo registro. É a abordagem correta para sistemas concorrentes.
+
+### 4. Por que `FOR UPDATE SKIP LOCKED` no merge?
+
+```
+SEM SKIP LOCKED:                       COM SKIP LOCKED:
+Worker 1: SELECT ... WHERE PENDING     Worker 1: SELECT ... FOR UPDATE SKIP LOCKED
+Worker 2: SELECT ... WHERE PENDING     Worker 2: SELECT ... FOR UPDATE SKIP LOCKED
+Ambos pegam OS MESMOS registros!       Cada um pega LOTES DIFERENTES!
+Processo duplicado!                    Processo paralelo seguro!
+```
+
+`SKIP LOCKED` diz: "pule os registros que estão locked por outra transação". Isso permite múltiplos workers de merge rodando em paralelo sem pisar no mesmo lote.
+
+### 5. Por que dois passos (INSERT + UPDATE) e não `ON CONFLICT DO UPDATE`?
+
+```sql
+-- Versão 1: ON CONFLICT DO UPDATE (1 passo)
+INSERT INTO custody_position (...)
+SELECT ... FROM staging
+ON CONFLICT (account_id, asset_id, reference_date) DO UPDATE
+SET quantity = EXCLUDED.quantity;
+
+-- Versão 2: INSERT + UPDATE (2 passos)
+INSERT INTO custody_position (...)
+SELECT ... FROM staging s
+WHERE NOT EXISTS (SELECT 1 FROM custody_position f WHERE ...);
+
+UPDATE custody_position f
+SET quantity = s.quantity
+FROM staging s
+WHERE f.chave = s.chave;
+```
+
+Na prática, para milhões de registros:
+
+| Abordagem | Prós | Contras |
+|-----------|------|---------|
+| `ON CONFLICT DO UPDATE` | 1 comando, mais simples | Gera dead tuple para cada update |
+| Dois passos | INSERT limpo + UPDATE explícito | 2 comandos, marginalmente mais lento |
+
+**Ambas funcionam.** O dois-passos foi escolhido por clareza e por separar a contagem de inserts vs updates.
+
+---
+
+## E se algo der errado?
+
+### Cenário 1: processo morre no meio do download
+
+```
+  Acontece: container cai, falta de memória, timeout de rede
+  Consequência: staging vazia (nenhum row group foi processado)
+  Recuperação: executar process_file.py de novo
+    → Checkpoint detecta que nada foi feito
+    → Reprocessa tudo
+```
+
+### Cenário 2: processo morre no meio do staging
+
+```
+  Acontece: DB connection drops durante insert de staging
+  Consequência: row group parcialmente inserido
+  Recuperação: executar process_file.py de novo
+    → ON CONFLICT DO NOTHING: linhas já inseridas são ignoradas
+    → Só insere as que faltam
+```
+
+### Cenário 3: merge morre no meio
+
+```
+  Acontece: deadlock, timeout, conexão perdida
+  Consequência: lote parcialmente mergeado
+    • staging ainda tem registros PENDING (não sofreram UPDATE MERGED)
+  Recuperação: executar merge_staging.py de novo
+    → FOR UPDATE SKIP LOCKED pega só os PENDING restantes
+    → ON CONFLICT DO UPDATE na final = idempotente
+```
+
+### Cenário 4: merge roda duas vezes (acidentalmente)
+
+```
+  Acontece: schedule duplicado, execução manual + automática
+  Consequência: merge_staging.py roda em paralelo
+    • Worker 1 pega lote A (SKIP LOCKED)
+    • Worker 2 pega lote B (SKIP LOCKED)
+  Resultado: cada lote é processado uma vez
+  Final: sem duplicatas, sem conflitos
+```
 
 ---
 
@@ -245,11 +516,21 @@ WHERE relname = 'custody_position';
 
 ---
 
-## Particionamento (Item 6)
+## Particionamento
 
 ### O que é?
 
 Particionamento divide uma tabela grande em **partições menores** baseadas em uma coluna-chave (ex: `reference_date`). O PostgreSQL roteia automaticamente cada registro para a partição correta.
+
+### Quando considerar
+
+```
+Tamanho da tabela        Recomendação
+────────────────────     ────────────────────
+< 10 milhões             Sem particionamento (overhead desnecessário)
+10-50 milhões            Avaliar particionamento mensal
+50+ milhões              Particionamento recomendado
+```
 
 ### Exemplo para `custody_position`
 
@@ -285,41 +566,66 @@ CREATE TABLE custody_position_default PARTITION OF custody_position DEFAULT;
 | **Paralelismo** | Cada partição pode ser vacuum/indexada independentemente |
 | **Archiving** | Partições antigas podem ser movidas para storage mais barato |
 
-### Exemplo de partition pruning
-
-```sql
--- PostgreSQL só escaneia a partição 2025_01
-EXPLAIN SELECT * FROM custody_position
-WHERE reference_date = '2025-01-15';
-```
-
 ### Cuidados
 
 | Cuidado | Por quê |
 |---------|---------|
 | PK precisa incluir a coluna de partição | Limitação do PostgreSQL |
-| Não é adequado para tabelas com < 10M registros | Overhead desnecessário |
-| Migração de tabela não-particionada para particionada requer rebuild | `CREATE TABLE ... PARTITION BY RANGE` + `INSERT INTO ... SELECT` |
 | Constraints únicas entre partições não são possíveis | Cada partição tem seu próprio índice único |
-
-> ⚠️ Para esta POC, o particionamento é desnecessário (< 100 registros). Em produção, considere quando a tabela ultrapassar **10-50 milhões de registros**.
+| Migração requer rebuild | `CREATE TABLE ... PARTITION BY RANGE` + `INSERT INTO ... SELECT` |
 
 ---
 
 ## MiniStack / LocalStack
 
-Este projeto utiliza a imagem `localstack/localstack:latest` com `SERVICES=s3` como emulador S3 compatível com MiniStack (modo gratuito). O LocalStack Community Edition é gratuito e oferece o serviço S3 sem necessidade de licença.
+Este projeto utiliza a imagem `localstack/localstack:latest` com `SERVICES=s3` como emulador S3
+compatível com MiniStack (modo gratuito). O LocalStack Community Edition é gratuito e oferece
+o serviço S3 sem necessidade de licença, chave AWS ou conta.
 
-Para usar o MiniStack oficial, altere a imagem no `docker-compose.yml` para `ministackorg/ministack:latest` (se disponível) e ajuste as configurações conforme documentação.
+Para usar o MiniStack oficial, altere a imagem no `docker-compose.yml` para
+`ministackorg/ministack:latest` (se disponível) e ajuste as configurações conforme documentação.
+
+---
 
 ## Troubleshooting
 
-| Problema | Solução |
-|----------|---------|
-| `Connection refused` no S3 | Verifique se o LocalStack está rodando: `docker compose ps` |
-| `Connection refused` no PostgreSQL | Aguarde o healthcheck passar: `docker compose ps` (status "healthy") |
-| Erro `BucketAlreadyOwnedByYou` | Normal — o script trata como aviso. |
-| `pyarrow` não instalou | Use `pip install pyarrow` separadamente; requer Python 3.9+ |
-| Tabelas não criadas | Os scripts SQL em `./sql/` rodam apenas na primeira subida do container. Recrie com `docker compose down -v && docker compose up -d` |
-| Merge lento | Ajuste `MERGE_BATCH_SIZE` no `.env` ou via variável de ambiente |
-| Table bloat suspeito | Execute `VACUUM ANALYZE custody_position` |
+| Problema | Causa provável | Solução |
+|----------|---------------|---------|
+| `Connection refused` no S3 | LocalStack não está pronto | `docker compose ps` — aguarde "healthy" |
+| `Connection refused` no PostgreSQL | PostgreSQL não está pronto | `docker compose ps` — aguarde "healthy" |
+| `MultiPartUpload` ou `BucketAlreadyOwnedByYou` | Bucket já existe | Normal — o script trata como aviso |
+| `NoSuchBucket` no processamento | Bucket foi recriado | Execute `upload_to_s3.py` novamente |
+| `pyarrow` não instalou | Dependência faltando | `pip install pyarrow` separadamente |
+| Tabelas não existem | Volume PostgreSQL foi removido | `docker compose down -v && docker compose up -d` |
+| Merge lento | Batch size muito pequeno | Ajuste `MERGE_BATCH_SIZE=50000` |
+| Erro `seek` no S3 | StreamingBody não seekable | (já corrigido na versão atual com BytesIO) |
+| Table bloat suspeito | Muitos dead tuples | `VACUUM ANALYZE custody_position` |
+
+---
+
+## Consultas úteis
+
+```bash
+# Acessar o banco
+docker exec -it poc-postgres psql -U pocuser -d pocdb
+
+# Tabela final — todos os registros
+SELECT * FROM custody_position ORDER BY account_id, asset_id, reference_date;
+
+# Staging — status dos lotes
+SELECT batch_id, status, COUNT(*) AS registros
+FROM custody_position_staging
+GROUP BY batch_id, status
+ORDER BY batch_id;
+
+# Erros por lote
+SELECT e.batch_id, e.error_reason, COUNT(*) AS ocorrencias
+FROM custody_position_error e
+GROUP BY e.batch_id, e.error_reason
+ORDER BY e.batch_id;
+
+# Data de atualização dos registros na final
+SELECT account_id, asset_id, quantity, updated_at
+FROM custody_position
+WHERE updated_at > NOW() - INTERVAL '1 hour';
+```
