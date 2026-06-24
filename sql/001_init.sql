@@ -35,5 +35,6 @@ CREATE TABLE IF NOT EXISTS custody_position_error (
     row_number INTEGER NOT NULL,
     payload JSONB NOT NULL,
     error_reason TEXT NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (source_file, row_number)
 );

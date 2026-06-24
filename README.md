@@ -7,7 +7,11 @@ Prova de conceito de um pipeline de processamento batch de arquivos Parquet arma
 1. **Docker Compose** sobe PostgreSQL 16 e LocalStack (S3 emulator).
 2. **Script Python** gera um arquivo Parquet com ~25 registros (incluindo válidos, updates e inválidos).
 3. **Upload** do arquivo para o bucket S3 local.
-4. **Processamento** em chunks: baixa o Parquet, valida cada linha, insere válidos na staging e inválidos na tabela de erro.
+4. **Processamento via streaming de row groups**: 
+   - **Metadata first**: apenas o footer do Parquet é baixado via Range request para ler a estrutura de row groups
+   - **Streaming paralelo**: cada row group é baixado sob demanda por um worker independente (cada um com sua própria conexão S3 via Range requests e conexão PostgreSQL)
+   - **Validação**: cada worker valida suas linhas, insere válidos na staging e inválidos na tabela de erro
+   - **Checkpoint implícito**: se o processo for interrompido e retomado, row groups já processados são detectados via `ON CONFLICT DO NOTHING` e ignorados
 5. **Merge em lotes** (batch merge): processa registros pendentes da staging em lotes de 10.000 (configurável via `MERGE_BATCH_SIZE`). Cada lote:
    - **Passo 1**: insere na tabela final apenas registros que **não existem** (`WHERE NOT EXISTS`)
    - **Passo 2**: atualiza na tabela final registros que **já existem** (`UPDATE via JOIN`)
@@ -99,6 +103,48 @@ SELECT * FROM custody_position_error;
 ---
 
 ## Arquitetura para Produção
+
+### Por que processamento via streaming de row groups (não o arquivo inteiro)?
+
+A primeira versão desta POC baixava o **arquivo Parquet inteiro** para a memória antes de processar:
+
+```python
+# ANTIGO: arquivo inteiro na RAM
+resp = s3.get_object(Bucket=bucket, Key=key)
+df = pd.read_parquet(io.BytesIO(resp["Body"].read()))
+```
+
+Para milhões de registros, isso é inviável:
+- Um Parquet de 10M registros ≈ 200 MB a 1 GB
+- Não escala horizontalmente (single-thread, memória única)
+- Se o processo morre no meio, tudo é perdido
+
+A nova versão usa **streaming de row groups** via `s3fs` (Range GET requests):
+
+```python
+# NOVO: streaming row group a row group
+with fs.open(s3_path, 'rb') as f:
+    pf = pq.ParquetFile(f)           # só lê o footer (Range request, ~KB)
+    for rg_idx in range(pf.metadata.num_row_groups):
+        table = pf.read_row_group(rg_idx)  # Range request por row group
+```
+
+```
+Download:  [Footer (KB)]─────[RG 0]─────[RG 1]─────[RG 2]─────...
+           │                 │         │         │
+           │             Worker 1   Worker 2   Worker 3
+           │             (thread)  (thread)  (thread)
+           │                 │         │         │
+Memória:   ~KB             ~batch    ~batch    ~batch
+```
+
+Cada worker:
+- Abre sua própria conexão S3 (Range request para UM row group)
+- Abre sua própria conexão PostgreSQL
+- Processa apenas seu row group
+- Não depende de outros workers
+
+Se um worker falha, só o row group dele precisa ser reprocessado.
 
 ### Por que merge em lotes (batch merge)?
 
