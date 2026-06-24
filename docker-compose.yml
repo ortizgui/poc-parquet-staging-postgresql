@@ -21,14 +21,14 @@ services:
     image: localstack/localstack:latest
     container_name: poc-ministack
     environment:
-      SERVICES: s3
+      SERVICES: s3,sqs
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
     ports:
       - "4566:4566"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 5
