@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import psycopg2
+from psycopg2.extras import execute_values
 import pyarrow.parquet as pq
 import s3fs
 from dotenv import load_dotenv
@@ -88,6 +89,21 @@ def process_row_group(
 
     Each invocation runs in its own thread and opens independent
     connections to S3 (Range GET streaming) and PostgreSQL.
+
+    Trickle-down memory model.
+    ──────────────────────────
+    Memoria por worker ≈ tamanho do row group (DataFrame) +
+                         listas de tuplas para batch INSERT.
+
+    Para 100k linhas por row group:
+      DataFrame: ~30-50 MB
+      Listas:    ~10-20 MB
+      Total:     ~50-70 MB / worker
+
+    Com 4 workers simultaneos: ~200-280 MB total.
+
+    Controle de memoria via configuracao do row group size
+    na geracao do Parquet (ex: row_group_size=50000).
     """
     fs = s3fs.S3FileSystem(
         key="test",
@@ -104,6 +120,7 @@ def process_row_group(
 
     try:
         # --- 1. Stream one row-group from S3 via Range requests ---
+        #     So o row-group designado e baixado — nunca o arquivo todo.
         with fs.open(s3_path, "rb") as f:
             pf = pq.ParquetFile(f)
             table = pf.read_row_group(rg_idx)
@@ -111,57 +128,67 @@ def process_row_group(
         df = table.to_pandas()
         result["rows"] = len(df)
 
-        # --- 2. Validate & insert each row ---
+        # --- 2. Validation loop + build batch lists ---
+        #     Percorre as N linhas UMA vez (O(N), inevitavel).
+        #     Acumula tuplas para INSERT em batch ao inves de
+        #     N inserts individuais.
+        valid_rows: list[tuple] = []
+        invalid_rows: list[tuple] = []
+
         for local_idx, (_, row) in enumerate(df.iterrows()):
             row_number = start_row + local_idx
             errors = validate_row(row)
-            payload = {
-                "account_id": str(row.get("account_id", "")),
-                "asset_id": str(row.get("asset_id", "")),
-                "reference_date": str(row.get("reference_date", "")),
-                "quantity": row.get("quantity"),
-                "amount": row.get("amount"),
-            }
+            ref_date = (
+                row["reference_date"].to_pydatetime()
+                if hasattr(row["reference_date"], "to_pydatetime")
+                else row["reference_date"]
+            )
 
             if errors:
-                # Validation error → error table (deterministic, no savepoint needed)
-                reason = "; ".join(errors)
-                cur.execute(
-                    """
-                    INSERT INTO custody_position_error
-                        (batch_id, source_file, row_number, payload, error_reason)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (source_file, row_number) DO NOTHING
-                    """,
-                    (str(batch_id), source_file, row_number,
-                     json.dumps(payload), reason),
-                )
-                if cur.rowcount > 0:
-                    result["invalid"] += 1
+                invalid_rows.append((
+                    str(batch_id), source_file, row_number,
+                    json.dumps({
+                        "account_id": str(row.get("account_id", "")),
+                        "asset_id": str(row.get("asset_id", "")),
+                        "reference_date": str(row.get("reference_date", "")),
+                        "quantity": row.get("quantity"),
+                        "amount": row.get("amount"),
+                    }),
+                    "; ".join(errors),
+                ))
             else:
                 record_hash = compute_record_hash(row)
-                cur.execute(
-                    """
-                    INSERT INTO custody_position_staging
-                        (batch_id, source_file, row_number, record_hash,
-                         account_id, asset_id, reference_date, quantity, amount)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (source_file, row_number) DO NOTHING
-                    """,
-                    (
-                        str(batch_id), source_file, row_number, record_hash,
-                        row["account_id"], row["asset_id"],
-                        row["reference_date"].to_pydatetime()
-                            if hasattr(row["reference_date"], "to_pydatetime")
-                            else row["reference_date"],
-                        row["quantity"], row["amount"],
-                    ),
-                )
-                if cur.rowcount > 0:
-                    result["valid"] += 1
-                else:
-                    result["duplicate"] += 1
+                valid_rows.append((
+                    str(batch_id), source_file, row_number, record_hash,
+                    row["account_id"], row["asset_id"],
+                    ref_date, row["quantity"], row["amount"],
+                ))
 
+        # --- 3. Batch INSERT valid rows (1 statement, N rows) ---
+        if valid_rows:
+            execute_values(cur, """
+                INSERT INTO custody_position_staging
+                    (batch_id, source_file, row_number, record_hash,
+                     account_id, asset_id, reference_date, quantity, amount)
+                VALUES %s
+                ON CONFLICT (source_file, row_number) DO NOTHING
+            """, valid_rows)
+            result["valid"] = cur.rowcount
+            result["duplicate"] = len(valid_rows) - cur.rowcount
+
+        # --- 4. Batch INSERT invalid rows (1 statement, N rows) ---
+        if invalid_rows:
+            execute_values(cur, """
+                INSERT INTO custody_position_error
+                    (batch_id, source_file, row_number, payload, error_reason)
+                VALUES %s
+                ON CONFLICT (source_file, row_number) DO NOTHING
+            """, invalid_rows)
+            result["invalid"] = len(invalid_rows)
+
+        # Libera as listas antes do commit (menos memória em pico)
+        del valid_rows
+        del invalid_rows
         conn.commit()
 
     except Exception:
@@ -273,8 +300,9 @@ def main():
             rg_idx = future_map[future]
             try:
                 res = future.result()
-                for k in ("valid", "invalid", "duplicate", "rows"):
+                for k in ("valid", "invalid", "rows"):
                     aggregator[k] += res[k]
+                aggregator["duplicate"] += res.get("duplicate", 0)
                 print(
                     f"  RG {rg_idx:>2}: {res['valid']:>3} validos, "
                     f"{res['invalid']:>3} invalidos, "
