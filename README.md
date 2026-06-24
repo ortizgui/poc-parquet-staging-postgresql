@@ -58,11 +58,12 @@ Prova de conceito de um pipeline batch que lê arquivos Parquet do S3, valida re
 7. [O papel de cada tabela](#o-papel-de-cada-tabela)
 8. [Idempotência: camada por camada](#idempotência-camada-por-camada)
 9. [Decisões de arquitetura](#decisões-de-arquitetura)
-10. [E se algo der errado?](#e-se-algo-der-errado)
-11. [VACUUM](#vacuum)
-12. [Particionamento](#particionamento)
-13. [MiniStack / LocalStack](#ministack--localstack)
-14. [Troubleshooting](#troubleshooting)
+10. [Comparação: Row Groups vs SQS por Registro](#comparação-row-groups-vs-sqs-por-registro)
+11. [E se algo der errado?](#e-se-algo-der-errado)
+12. [VACUUM](#vacuum)
+13. [Particionamento](#particionamento)
+14. [MiniStack / LocalStack](#ministack--localstack)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -221,10 +222,11 @@ python scripts/upload_to_s3.py
 #   Bucket criado: poc-bucket
 #   Arquivo enviado: s3://poc-bucket/input/custody_position.parquet
 
-# Etapa 3 — Processar em streaming paralelo
+# Etapa 3 — Processar em streaming paralelo (row groups)
 python scripts/process_file.py --bucket poc-bucket \
-                               --key input/custody_position.parquet \
-                               --chunk-size 5
+                               --key input/custody_position.parquet
+# Opcional: tamanho do lote de validacao por worker (default 5)
+# python scripts/process_file.py --bucket poc-bucket --key ... --chunk-size 10
 # Output:
 #   batch_id: 025c8e45-...
 #   Total linhas: 24 | Row groups: 1
@@ -408,6 +410,266 @@ Na prática, para milhões de registros:
 **Ambas funcionam.** O dois-passos foi escolhido por clareza e por separar a contagem de inserts vs updates.
 
 ---
+
+---
+
+## Comparação: Row Groups vs SQS por Registro
+
+### Contexto
+
+Uma arquitetura alternativa seria transformar **cada registro** do arquivo Parquet em uma **mensagem individual em uma fila SQS**. Essa abordagem oferece alto nível de desacoplamento e reprocessamento granular, porém adiciona complexidade operacional significativa para um cenário cujo objetivo principal é realizar **carga massiva de dados em um banco PostgreSQL**.
+
+Após análise, optou-se por uma estratégia baseada em **leitura de row groups em streaming**, inserção em tabela de staging e merge para a tabela final.
+
+```
+ABORDAGEM ESCOLHIDA (Row Groups Streaming):     ALTERNATIVA (SQS por registro):
+───────────────────────────────                  ────────────────────────────────
+S3 (Parquet)                                     S3 (Parquet)
+    │                                                  │
+    ▼                                                  ▼
+Leitura do Footer (Range GET)                   Leitura do arquivo inteiro
+    │                                                  │
+    ▼                                                  ▼
+Workers paralelos (ThreadPool)                  1.000.000 mensagens SQS
+    │  cada um lê 1 row group                        │
+    ▼                                                  ▼
+Validação em lote                                1.000.000 consumers
+    │                                                  │
+    ▼                                                  ▼
+Staging Table + Error Table                      Fila + DLQ + Retry + Monitoramento
+    │                                                  │
+    ▼                                                  ▼
+Merge upsert (batch)                            1.000.000 inserts individuais
+```
+
+### 1. Menor Complexidade Arquitetural
+
+Na abordagem baseada em eventos, **cada linha** do arquivo gera uma mensagem SQS:
+
+```
+Arquivo com 1.000.000 linhas
+=
+1.000.000 mensagens SQS
+```
+
+Além da fila principal, são necessários:
+
+- Consumers (ECS/Lambda) com escalonamento
+- Dead Letter Queue (DLQ) para falhas
+- Controle de duplicidade na entrega
+- Monitoramento de backlog (CloudWatch)
+- Estratégias de retry com backoff
+
+Na abordagem em **row groups**, o sistema trabalha diretamente sobre o arquivo original via **Range GET requests** — sem fila, sem consumers, sem DLQ. Cada worker do `ThreadPoolExecutor` abre sua própria conexão S3 (Range GET para um row group) e sua própria conexão PostgreSQL.
+
+| Componente | SQS por registro | Row Groups streaming |
+|------------|-----------------|---------------------|
+| Mensageria | Fila SQS + DLQ | Nenhuma |
+| Consumers | Lambda ou ECS (auto-scaling) | ThreadPoolExecutor (N workers) |
+| Duplicidade | ID de dedup + lambda idempotente | ON CONFLICT DO NOTHING |
+| Monitoramento | CloudWatch fila + consumer | Logs no terminal |
+| Complexidade total | Alta | Baixa |
+
+### 2. Melhor Eficiência para Cargas Massivas
+
+O PostgreSQL é otimizado para **operações em lote**, não para inserts individuais.
+
+Inserir 1 registro por vez gera:
+
+- N round-trips de rede (1 por linha)
+- N transações (ou 1 transação gigante)
+- N vezes mais CPU no banco
+- N vezes mais WAL (Write Ahead Log)
+
+Nosso fluxo atual:
+
+```
+1.000.000 registros em um Parquet
+
+Row groups (típico: 100k linhas por grupo):
+  ~10 row groups
+  10 Range GET requests
+  10 workers paralelos
+  10 inserts em lote na staging
+
+Merge:
+  Batch upsert de 10.000 em 10.000
+  = 100 transações curtas
+```
+
+O volume de operações no banco é **drasticamente reduzido** — de 1.000.000 inserts individuais para ~100 operações em lote.
+
+### 3. Menor Custo Operacional
+
+Na estratégia SQS por registro:
+
+| Recurso | Impacto |
+|---------|---------|
+| **SQS** | 1.000.000 mensagens por arquivo |
+| **Lambda/ECS** | 1.000.000 invocações |
+| **Rede** | 1.000.000 chamadas de API |
+| **DB connections** | Centenas de connections por minuto |
+| **Logs** | 1.000.000 entradas de log |
+| **Monitoramento** | 1.000.000 métricas de fila |
+
+Na abordagem em row groups:
+
+| Recurso | Impacto |
+|---------|---------|
+| **S3** | 1 head + footer + N Range GETs (N = row groups) |
+| **Threads** | N workers simultâneos (configurável) |
+| **Rede** | N chamadas S3 + poucas chamadas DB |
+| **DB connections** | N connections simultâneas |
+| **Logs** | 1 linha por worker processado |
+| **Monitoramento** | Métricas do próprio script |
+
+O custo está relacionado à **quantidade de row groups** (estrutura interna do Parquet), não à quantidade de registros. Para arquivos grandes, você pode controlar o tamanho dos row groups na geração do Parquet.
+
+### 4. Idempotência Continua Garantida
+
+Uma preocupação comum ao abandonar o modelo de eventos individuais é perder a capacidade de evitar duplicações.
+
+Isso é resolvido através de:
+
+- **`batch_id`**: UUID único por execução do processamento
+- **`source_file`**: identificador do arquivo de origem
+- **`row_number`**: número da linha dentro do arquivo
+- **`record_hash`**: SHA256 dos dados da linha para dedup fino
+- **Constraints únicas** no banco PostgreSQL
+
+```sql
+-- Impede o mesmo arquivo+linha de ser inserido duas vezes
+UNIQUE (source_file, row_number)
+
+-- Impede o mesmo dado (hash) de ser inserido duas vezes
+UNIQUE (source_file, record_hash)
+```
+
+Se o mesmo arquivo for processado novamente, o PostgreSQL ignora registros já existentes:
+
+```sql
+INSERT INTO custody_position_staging (...)
+VALUES (...)
+ON CONFLICT (source_file, row_number) DO NOTHING
+```
+
+Dessa forma, o processamento permanece seguro e idempotente **sem necessidade de fila**.
+
+### 5. Reprocessamento Continua Possível
+
+Embora não exista uma mensagem SQS para cada linha, ainda é possível reprocessar dados de forma controlada:
+
+| Estratégia | Como fazer |
+|------------|------------|
+| **Reprocessar arquivo inteiro** | Executar `process_file.py` de novo (ON CONFLICT ignora staging duplicada) |
+| **Reprocessar merge** | Executar `merge_staging.py` de novo (só processa PENDING restantes) |
+| **Reprocessar apenas inválidos** | Corrigir dados e gerar novo Parquet com batch_id diferente |
+| **Compensação manual** | UPDATE diretamente na staging com status = 'PENDING' e rodar merge |
+
+No modelo SQS por registro, reprocessar exigiria reenfileirar N mensagens ou implementar um mecanismo de replay na DLQ.
+
+### 6. Tratamento de Erros Mais Simples
+
+Na abordagem SQS, cada falha gera:
+
+1. Mensagem vai para DLQ
+2. Alarme no CloudWatch
+3. Operador precisa investigar
+4. Decidir entre descartar, corrigir e reenfileirar
+5. Se o erro é no dado (não no processamento), a DLQ enche sem solução
+
+Na abordagem em row groups:
+
+- **Registros válidos** → staging (status PENDING)
+- **Registros inválidos** → `custody_position_error` com payload original + motivo
+- **O processamento continua** — um registro inválido não quebra o lote
+
+```
+Exemplo real na POC:
+24 registros processados
+20 válidos → staging
+  4 inválidos → custody_position_error
+    • ACC006/INVL1: quantity is invalid: -100.0
+    • (empty)/INVL2: account_id is empty
+    • ACC007/(empty): asset_id is empty
+    • ACC008/INVL4: amount is invalid: -500.0
+
+Nenhuma fila, nenhuma DLQ, nenhuma interrupção.
+```
+
+### 7. Melhor Auditoria e Rastreabilidade
+
+A tabela de staging cria um **histórico explícito** do processamento:
+
+| Coluna | O que armazena |
+|--------|---------------|
+| `batch_id` | UUID da execução do processamento |
+| `source_file` | s3://bucket/path/arquivo.parquet |
+| `row_number` | Linha exata dentro do arquivo |
+| `record_hash` | SHA256 do conteúdo da linha |
+| `status` | PENDING → MERGED |
+| `created_at` | Quando foi inserido na staging |
+| `merged_at` | Quando foi integrado à final |
+
+A tabela de erro armazena o `payload` completo em JSONB — cópia fiel do registro que falhou:
+
+```sql
+SELECT error_reason, payload->>'account_id' AS conta,
+       payload->>'asset_id' AS ativo
+FROM custody_position_error
+WHERE batch_id = '025c8e45-...';
+```
+
+No modelo SQS, a rastreabilidade dependeria de logs do consumer e da mensagem na DLQ — mais difusa e sem estrutura relacional.
+
+### 8. Separação Clara Entre Ingestão e Atualização
+
+O fluxo divide o pipeline em **duas etapas independentes**:
+
+```
+Etapa 1 — Ingestão (process_file.py)
+──────────────────────────────────────
+  Responsabilidade: baixar, validar, armazenar na staging
+  Pode rodar em janela noturna
+  Não impacta consultas na tabela final
+
+Etapa 2 — Atualização (merge_staging.py)
+──────────────────────────────────────
+  Responsabilidade: aplicar regras de negócio (upsert)
+  Pode rodar após validação da staging
+  Transação curta por lote (não bloqueia)
+```
+
+Essa separação reduz o **acoplamento** e simplifica a **manutenção**. Cada etapa pode evoluir independentemente — por exemplo, a ingestão pode ganhar novos validadores sem afetar o merge, e o merge pode mudar a estratégia de upsert sem revalidar os dados.
+
+### Quando SQS por registro faz sentido
+
+A abordagem baseada em eventos individuais **continua sendo a melhor escolha** quando:
+
+- **Cada registro requer processamento complexo e heterogêneo** (ex: calls a APIs externas, enriquecimento, transformação)
+- **Há integrações externas por registro** (ex: notificar sistema A para ativo X, sistema B para ativo Y)
+- **O tempo de processamento varia significativamente entre mensagens** (ex: 1 registro leva 10ms, outro leva 30s — fila permite escalonamento natural)
+- **Há necessidade de paralelismo extremo com backpressure** (a fila SQS é um buffer natural entre produtor e consumidor)
+- **O sistema é orientado a eventos por design** (outros consumidores reagem a cada registro individualmente)
+
+**Nenhum desses cenários se aplica ao nosso caso**, cujo objetivo é **carga massiva e atualização de dados em banco relacional** com máximo throughput e mínima complexidade.
+
+### Conclusão da Comparação
+
+| Critério | Row Groups (nossa solução) | SQS por registro |
+|----------|---------------------------|------------------|
+| Complexidade arquitetural | Baixa (1 script, 1 worker pool) | Alta (fila, consumer, DLQ, monitoramento) |
+| Throughput no DB | Alto (batch insert) | Baixo (insert individual) |
+| Custo operacional | Previsível (por arquivo) | Proporcional (por registro) |
+| Idempotência | ON CONFLICT DO NOTHING | ID de dedup na fila |
+| Reprocessamento | Simples (reprocessar arquivo) | Complexo (replay de fila) |
+| Tratamento de erros | Tabela de erro + continua lote | DLQ + interrompe lote |
+| Rastreabilidade | Structured (banco relacional) | Difusa (logs + DLQ) |
+| Acoplamento ingestão/atualização | Baixo (separado por script) | Alto (consumer único) |
+| Ideal para | Carga massiva em banco relacional | Processamento heterogêneo por registro |
+
+A solução com row groups mantém características importantes como **idempotência, rastreabilidade e capacidade de reprocessamento**, ao mesmo tempo que evita a complexidade e o custo associados à criação e gerenciamento de milhões de mensagens individuais em filas SQS.
+
 
 ## E se algo der errado?
 
