@@ -413,6 +413,113 @@ Na prática, para milhões de registros:
 
 ---
 
+### 6. Como isolar erros dentro de um row group sem perder as demais linhas?
+
+Quando um worker processa um row group, cada linha passa por duas etapas:
+
+```
+Para cada linha do row group:
+  ┌─────────────────────────────────────────────────┐
+  │ Etapa 1 — Validação em Python                    │
+  │   • account_id não vazio?                        │
+  │   • asset_id não vazio?                          │
+  │   • quantity >= 0?                               │
+  │   • amount >= 0?                                 │
+  │                                                  │
+  │   Se falha → custody_position_error (seguro)     │
+  │   Se passa → próxima etapa                       │
+  └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────┐
+  │ Etapa 2 — INSERT no PostgreSQL                   │
+  │   • Pode falhar mesmo após validação?            │
+  │     SIM: overflow numérico, encoding, etc.       │
+  │                                                  │
+  │   Proteção: SAVEPOINT por linha                  │
+  │   Se falha → rollback só desta linha             │
+  │   → Vai para custody_position_error              │
+  │   → Demais linhas CONTINUAM                       │
+  └─────────────────────────────────────────────────┘
+```
+
+#### O problema
+
+Originalmente, todo o row group era uma única transação:
+
+```python
+for row in row_group:
+    INSERT INTO staging ...   # linha 5 falha → transação aborta
+                                # linhas 1-4 também são perdidas!
+conn.commit()                 # nunca chega aqui
+```
+
+Se a linha 5 de 10.000 falha por um overflow numérico, a transação inteira aborta e TODAS as 10.000 linhas são perdidas — mesmo as que já foram inseridas com sucesso.
+
+#### A solução: SAVEPOINT
+
+O PostgreSQL oferece **savepoints** — pontos de salvamento dentro de uma transação:
+
+```python
+for row in row_group:
+    try:
+        cur.execute("SAVEPOINT sp_linha_X")       # ← marca um checkpoint
+        cur.execute("INSERT INTO staging ...")      # ← tenta inserir
+        cur.execute("RELEASE SAVEPOINT sp_linha_X") # ← sucesso: confirma checkpoint
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT sp_linha_X")  # ← falha: volta ao checkpoint
+        cur.execute("INSERT INTO custody_position_error ...")  # ← log do erro
+        # ★ A transação CONTINUA — outras linhas são processadas normalmente
+```
+
+```
+SAVEPOINT na prática:
+─────────────────────
+
+Transação do row group:
+│
+├─ SAVEPOINT sp_0 → INSERT linha 0 → RELEASE  ✓
+├─ SAVEPOINT sp_1 → INSERT linha 1 → RELEASE  ✓
+├─ SAVEPOINT sp_2 → INSERT linha 2 → FALHOU!   ← overflow numérico
+│  └─ ROLLBACK TO sp_2 → INSERT custody_position_error → CONTINUA
+├─ SAVEPOINT sp_3 → INSERT linha 3 → RELEASE  ✓
+├─ ...
+│
+└─ COMMIT  ← linhas 0,1,3+ estão na staging; linha 2 está na tabela de erro
+```
+
+#### Impacto em performance
+
+Savepoints geram registros adicionais no WAL (Write Ahead Log). Para 1M linhas, são 1M savepoints. O overhead existe mas é **marginal comparado ao custo do INSERT em si** — tipicamente < 5% de degradação.
+
+**Alternativa mais performática (não implementada na POC):**
+
+Para produção com throughput máximo, pode-se usar savepoints **apenas no primeiro erro de um row group**, e então processar o restante das linhas com savepoints:
+
+```python
+# Fast path: sem savepoints (maioria dos casos)
+for row in row_group[:first_error]:
+    INSERT INTO staging ...
+
+# Slow path: com savepoints (só a partir do primeiro erro)
+for row in row_group[first_error:]:
+    SAVEPOINT → INSERT → RELEASE ou ROLLBACK
+```
+
+Isso porque, na prática, erros de DB após validação são **extremamente raros** — o savepoint é uma rede de segurança, não o caminho principal.
+
+#### Resumo
+
+| Situação | O que acontece | Ação |
+|----------|---------------|------|
+| **Validação falha** (ex: account_id vazio) | INSERT na custody_position_error | Continua para a próxima linha |
+| **DB insert falha** (ex: overflow) | ROLLBACK TO SAVEPOINT + INSERT no erro | Continua para a próxima linha |
+| **Conexão cai** | Exceção não capturada → rollback do row group | Worker reinicia o row group |
+| **Disco cheio** | Exceção não capturada → rollback do row group | Escalar storage |
+| **Tudo ok** | COMMIT do row group | Próximo worker ou fim |
+
+A linha defeituosa nunca bloqueia as demais — a menos que o problema seja sistêmico (conexão, disco, memória), caso em que isolar por linha não faria diferença.
+
 ## Comparação: Row Groups vs SQS por Registro
 
 ### Contexto
