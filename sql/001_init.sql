@@ -1,3 +1,5 @@
+DROP TABLE IF EXISTS custody_position_staging;
+
 CREATE TABLE IF NOT EXISTS custody_position (
     id SERIAL PRIMARY KEY,
     account_id VARCHAR NOT NULL,
@@ -9,7 +11,7 @@ CREATE TABLE IF NOT EXISTS custody_position (
     UNIQUE (account_id, asset_id, reference_date)
 );
 
-CREATE TABLE IF NOT EXISTS custody_position_staging (
+CREATE TABLE IF NOT EXISTS custody_position_buffer (
     id SERIAL PRIMARY KEY,
     batch_id UUID NOT NULL,
     source_file VARCHAR NOT NULL,
