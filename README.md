@@ -87,6 +87,12 @@ flowchart TD
 - `pg_advisory_lock(42)` previne merges concorrentes
 - `FOR UPDATE SKIP LOCKED` para processamento paralelo seguro
 - Lotes de 10.000 registros
+- UPDATE condicional: so altera registros se `quantity` ou `amount` mudaram
+  (`IS DISTINCT FROM` evita writes desnecessarios e preserva `updated_at`)
+
+### Cleanup da Buffer Table
+- Apos o merge, registros com `status = 'MERGED'` sao deletados da buffer table
+- A buffer table mantém apenas registros `PENDING` (aguardando merge) e erros
 
 ## Stack
 

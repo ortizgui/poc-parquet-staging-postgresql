@@ -101,6 +101,8 @@ def main():
                   AND f.account_id = s.account_id
                   AND f.asset_id = s.asset_id
                   AND f.reference_date = s.reference_date
+                  AND (f.quantity IS DISTINCT FROM s.quantity
+                    OR f.amount IS DISTINCT FROM s.amount)
             """, (batch_ids,))
             updated = cur.rowcount
 
@@ -126,6 +128,12 @@ def main():
 
         print(f"[MERGE] Registros processados: {total_merged}")
         print(f"[MERGE] Total final na tabela custody_position: {final_count}")
+
+        # Cleanup: remove merged records from buffer table
+        cur.execute("DELETE FROM custody_position_buffer WHERE status = 'MERGED'")
+        cleaned = cur.rowcount
+        conn.commit()
+        print(f"[MERGE] Buffer cleanup: {cleaned} MERGED records removed")
 
     finally:
         # Always release the advisory lock

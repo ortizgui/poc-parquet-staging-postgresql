@@ -10,6 +10,9 @@ Features:
   - Partial batch resilience: valid rows go to buffer, invalid to error table
   - Retry with backoff for DB connection failures (1s, 2s)
   - Structured logging with [CONSUMER2] prefix
+  - Resilience: if any INSERT fails, the entire batch is ROLLBACKed and messages
+    return to SQS via visibility timeout for reprocessing (all-or-nothing per
+    batch with SQS retry). ON CONFLICT DO NOTHING ensures idempotency on retry.
 
 Uso:
   python scripts/consume_records_to_db.py
