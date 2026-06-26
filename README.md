@@ -6,39 +6,40 @@ Prova de conceito do fluxo completo com SNS, DLQ, buffer table e merge.
 
 ```mermaid
 flowchart TD
-    subgraph AWS ["AWS (LocalStack)"]
-        S3[(S3 Bucket\npoc-bucket)]
-        SNS[SNS Topic\npoc-notification-topic]
-        SQS1[SQS #1\npoc-notification-queue\nDLQ: maxReceiveCount=3]
-        SQS2[SQS #2\npoc-record-queue\nDLQ: maxReceiveCount=5]
+    subgraph AWS [AWS - LocalStack]
+        S3[(S3 Bucket<br/>poc-bucket)]
+        SNS[SNS Topic<br/>poc-notification-topic]
+        SQS1[SQS #1<br/>poc-notification-queue<br/>DLQ: maxReceiveCount=3]
+        SQS2[SQS #2<br/>poc-record-queue<br/>DLQ: maxReceiveCount=5]
         DLQ1[poc-notification-dlq]
         DLQ2[poc-record-dlq]
     end
 
-    subgraph ECS1 ["ECS Service 1 (consume_s3_event.py)"]
-        LER[Read notification\nbucket + key]
-        PARQUET[Read Parquet streaming\ns3fs + row groups\nRange GET]
-        ENVIAR[Send each record\nto SQS #2\nbatches of 10]
+    subgraph ECS1 [ECS Service 1 - consume_s3_event]
+        LER[Read notification<br/>bucket + key]
+        PARQUET[Read Parquet streaming<br/>s3fs + row groups<br/>Range GET]
+        ENVIAR[Send each record<br/>to SQS #2<br/>batches of 10]
     end
 
-    subgraph ECS2 ["ECS Service 2 (consume_records_to_db.py)"]
-        RECEBER[Receive up to 10 msgs\nlong polling 5s]
-        VALIDAR[Validate each record\naccount_id, asset_id,\nquantity, amount]
-        BATCH[Batch INSERT\nexecute_values]
-        DELETAR[Delete msgs\nafter COMMIT]
+    subgraph ECS2 [ECS Service 2 - consume_records_to_db]
+        RECEBER[Receive up to 10 msgs<br/>long polling 5s]
+        VALIDAR[Validate each record<br/>account_id, asset_id,<br/>quantity, amount]
+        BATCH[Batch INSERT<br/>execute_values]
+        DELETAR[Delete msgs<br/>after COMMIT]
     end
 
-    subgraph DB ["PostgreSQL (pocdb)"]
-        BUFFER[custody_position_buffer\nPENDING -> MERGED]
-        ERRO[custody_position_error\npayload + reason]
-        FINAL[custody_position\nfinal table]
+    subgraph DB [PostgreSQL - pocdb]
+        BUFFER[custody_position_buffer<br/>PENDING -> MERGED -> cleanup]
+        ERRO[custody_position_error<br/>payload + reason]
+        FINAL[custody_position<br/>final table]
     end
 
-    subgraph MERGE ["Merge (merge_buffer.py)"]
-        UPSERT[Batch upsert\nINSERT WHERE NOT EXISTS\nUPDATE via JOIN\nFOR UPDATE SKIP LOCKED\npg_advisory_lock(42)]
+    subgraph MERGE [Merge - merge_buffer]
+        UPSERT[Batch upsert<br/>INSERT WHERE NOT EXISTS<br/>UPDATE via JOIN IS DISTINCT FROM<br/>FOR UPDATE SKIP LOCKED<br/>pg_advisory_lock 42]
+        CLEANUP[Delete MERGED records<br/>from buffer table]
     end
 
-    S3 -->|S3 Event Notification\nObjectCreated:Put| SNS
+    S3 -->|S3 Event Notification<br/>ObjectCreated:Put| SNS
     SNS -->|fanout| SQS1
     SQS1 -->|poll + delete| LER
     SQS1 -.->|exceeds 3 retries| DLQ1
@@ -58,8 +59,8 @@ flowchart TD
 
     BUFFER -->|status = PENDING| UPSERT
     UPSERT -->|upsert| FINAL
-
-    BUFFER -.->|after merge\nstatus = MERGED| MERGE
+    UPSERT -->|mark MERGED| CLEANUP
+    CLEANUP -->|DELETE MERGED| BUFFER
 ```
 
 ## Padroes de Resiliencia
