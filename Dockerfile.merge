@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY scripts/merge_buffer.py .
+COPY .env .
+CMD ["python", "merge_buffer.py"]

@@ -1,9 +1,9 @@
 """
-Simula o S3 enviando uma notificacao de objeto criado para uma fila SQS.
+Simula o S3 enviando uma notificacao de objeto criado para um topico SNS.
 
-Em producao, isso e feito automaticamente pela AWS (S3 Event Notification).
-Aqui no LocalStack, enviamos manualmente uma mensagem com o formato que
-o S3 usaria:
+Em producao, o S3 publica automaticamente (S3 Event Notification) no SNS.
+Aqui no LocalStack, publicamos manualmente no topico SNS com o formato
+que o S3 usaria:
 
   {
     "Records": [{
@@ -24,43 +24,33 @@ import json
 import os
 
 import boto3
-from botocore.config import Config
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
-SQS_ENDPOINT = os.getenv("AWS_ENDPOINT_URL", "http://localhost:4566")
-QUEUE_NAME = os.getenv("SQS_NOTIFICATION_QUEUE", "poc-notification-queue")
-
-
-def ensure_queue(sqs) -> str:
-    try:
-        resp = sqs.get_queue_url(QueueName=QUEUE_NAME)
-        return resp["QueueUrl"]
-    except sqs.exceptions.QueueDoesNotExist:
-        resp = sqs.create_queue(QueueName=QUEUE_NAME)
-        print(f"[NOTIFICATION] Fila criada: {resp['QueueUrl']}")
-        return resp["QueueUrl"]
+SNS_ENDPOINT = os.getenv("AWS_ENDPOINT_URL", "http://localhost:4566")
+SNS_TOPIC_NAME = os.getenv("SNS_TOPIC_NAME", "poc-notification-topic")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Simula S3 Event Notification para o SQS")
-    parser.add_argument("--bucket", required=True)
-    parser.add_argument("--key", required=True)
+    parser = argparse.ArgumentParser(description="Simula S3 Event Notification via SNS")
+    parser.add_argument("--bucket", required=True, help="S3 bucket name")
+    parser.add_argument("--key", required=True, help="S3 object key")
+    parser.add_argument("--topic", default=SNS_TOPIC_NAME, help="SNS topic name")
     args = parser.parse_args()
 
-    sqs = boto3.client(
-        "sqs",
-        endpoint_url=SQS_ENDPOINT,
+    sns = boto3.client(
+        "sns",
+        endpoint_url=SNS_ENDPOINT,
         aws_access_key_id="test",
         aws_secret_access_key="test",
         region_name="us-east-1",
-        config=Config(signature_version="s3v4"),
     )
 
-    queue_url = ensure_queue(sqs)
+    # Ensure topic exists
+    topic_resp = sns.create_topic(Name=args.topic)
+    topic_arn = topic_resp["TopicArn"]
 
-    # Mensagem no formato S3 Event Notification
     notification = {
         "Records": [
             {
@@ -80,11 +70,17 @@ def main():
         ]
     }
 
-    sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(notification))
-    print(f"[NOTIFICATION] S3 Event enviado para {QUEUE_NAME}")
-    print(f"  Bucket: {args.bucket}")
-    print(f"  Key:    {args.key}")
-    print(f"  Fila:   {queue_url}")
+    sns.publish(
+        TopicArn=topic_arn,
+        Message=json.dumps(notification),
+        Subject="S3 Event Notification",
+    )
+
+    print(f"[NOTIFICATION] S3 Event publicado via SNS")
+    print(f"  Topico ARN:  {topic_arn}")
+    print(f"  Topico Name: {args.topic}")
+    print(f"  Bucket:      {args.bucket}")
+    print(f"  Key:         {args.key}")
 
 
 if __name__ == "__main__":
