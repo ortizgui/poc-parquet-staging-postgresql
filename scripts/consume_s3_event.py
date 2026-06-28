@@ -1,15 +1,14 @@
 """
-ECS Service 1: Consume S3 event notifications from SQS #1, read Parquet, send rows to SQS #2.
+ECS Service: Consume S3 event notifications from SQS #1, call process_file.py for bulk insert.
 
-Flow:
-  SNS -> SQS #1 (notification queue with DLQ) -> this script -> SQS #2 (record queue with DLQ)
+Flow (Flow B - direct bulk insert):
+  SNS -> SQS #1 (notification queue) -> this script -> process_file.py -> Staging Table
 
 Features:
   - SNS envelope unwrapping (handles both SNS and direct SQS messages)
-  - DLQ auto-handling (messages exceeding maxReceiveCount go to DLQ)
-  - Exponential backoff for S3 reads (1s, 2s, 4s)
-  - Structured logging with [CONSUMER1] prefix
-  - Includes transform_version in record messages
+  - Calls process_file.py for each S3 event (bulk insert to staging)
+  - Exponential backoff for S3 reads (1s, 2s, 4s) handled by process_file.py
+  - Structured logging with [CONSUMER] prefix
 
 Uso:
   python scripts/consume_s3_event.py
@@ -17,36 +16,24 @@ Uso:
 
 import json
 import os
+import subprocess
+import sys
 import time
-import uuid
 
 import boto3
-import pyarrow.parquet as pq
-import s3fs
 from botocore.config import Config
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
+AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL", "http://localhost:4566")
 S3_ENDPOINT = os.getenv("AWS_ENDPOINT_URL", "http://localhost:4566")
 SQS_ENDPOINT = os.getenv("AWS_ENDPOINT_URL", "http://localhost:4566")
 
 NOTIFICATION_QUEUE = os.getenv("SQS_NOTIFICATION_QUEUE", "poc-notification-queue")
-RECORD_QUEUE = os.getenv("SQS_RECORD_QUEUE", "poc-record-queue")
 VISIBILITY_TIMEOUT = int(os.getenv("SQS_VISIBILITY_TIMEOUT", "30"))
-TRANSFORM_VERSION = 1
 
-LOG_PREFIX = "[CONSUMER1]"
-
-
-def ensure_record_queue(sqs) -> str:
-    try:
-        resp = sqs.get_queue_url(QueueName=RECORD_QUEUE)
-        return resp["QueueUrl"]
-    except sqs.exceptions.QueueDoesNotExist:
-        resp = sqs.create_queue(QueueName=RECORD_QUEUE)
-        print(f"{LOG_PREFIX} Record queue created: {resp['QueueUrl']}")
-        return resp["QueueUrl"]
+LOG_PREFIX = "[CONSUMER]"
 
 
 def unwrap_message(body: dict) -> dict:
@@ -62,48 +49,51 @@ def unwrap_message(body: dict) -> dict:
     return body
 
 
-def send_record_batch(sqs, queue_url: str, messages: list[dict]):
-    entries = [
-        {"Id": str(i), "MessageBody": json.dumps(msg, default=str)}
-        for i, msg in enumerate(messages)
+def call_process_file(bucket: str, key: str) -> bool:
+    """Call process_file.py to bulk insert Parquet to staging."""
+    script_path = os.path.join(os.path.dirname(__file__), "process_file.py")
+    
+    cmd = [
+        sys.executable,  # Use current Python interpreter
+        script_path,
+        "--bucket", bucket,
+        "--key", key,
     ]
-    resp = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
-    ok = len(resp.get("Successful", []))
-    fail = len(resp.get("Failed", []))
-    if fail:
-        failed_ids = [f["Id"] for f in resp.get("Failed", [])]
-        print(f"{LOG_PREFIX} Partial batch send failure: {fail}/{len(entries)} failed IDs: {failed_ids}")
-    return ok, fail
+    
+    print(f"{LOG_PREFIX} Calling process_file.py: bucket={bucket}, key={key}")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout per file
+        )
+        
+        if result.returncode == 0:
+            print(f"{LOG_PREFIX} process_file.py succeeded for s3://{bucket}/{key}")
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        print(f"{LOG_PREFIX}   {line}")
+            return True
+        else:
+            print(f"{LOG_PREFIX} process_file.py FAILED for s3://{bucket}/{key}")
+            print(f"{LOG_PREFIX}   stderr: {result.stderr[:500]}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        print(f"{LOG_PREFIX} process_file.py TIMEOUT for s3://{bucket}/{key}")
+        return False
+    except Exception as e:
+        print(f"{LOG_PREFIX} Error calling process_file.py: {e}")
+        return False
 
 
-def read_parquet_with_retry(s3_path: str, max_retries=3) -> pq.ParquetFile:
-    """Read Parquet from S3 with exponential backoff."""
-    delays = [1, 2, 4]
-    last_error = None
-
-    for attempt in range(max_retries):
-        try:
-            fs = s3fs.S3FileSystem(
-                key="test", secret="test",
-                client_kwargs={"endpoint_url": S3_ENDPOINT, "region_name": "us-east-1"},
-            )
-            f = fs.open(s3_path, "rb")
-            pf = pq.ParquetFile(f)
-            return pf, f, fs
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                delay = delays[min(attempt, len(delays) - 1)]
-                print(f"{LOG_PREFIX} S3 read attempt {attempt + 1} failed, retrying in {delay}s: {e}")
-                time.sleep(delay)
-
-    raise last_error
-
-
-def process_event(sqs, record_queue_url: str, body: dict) -> int:
-    batch_id = uuid.uuid4()
+def process_event(body: dict) -> int:
+    """Process a single S3 event notification."""
     records = body.get("Records", [])
-    total_enviados = 0
+    total_processed = 0
 
     for event in records:
         bucket = event.get("s3", {}).get("bucket", {}).get("name", "")
@@ -113,67 +103,25 @@ def process_event(sqs, record_queue_url: str, body: dict) -> int:
             print(f"{LOG_PREFIX} [SKIP] Event missing bucket/key")
             continue
 
+        # Skip non-parquet files
+        if not key.endswith('.parquet'):
+            print(f"{LOG_PREFIX} [SKIP] Not a parquet file: {key}")
+            continue
+
         source_file = f"s3://{bucket}/{key}"
-        s3_path = f"s3://{bucket}/{key}"
-        print(f"{LOG_PREFIX} Processing batch_id={batch_id} file={source_file}")
+        print(f"{LOG_PREFIX} Processing: {source_file}")
 
-        try:
-            pf, f, _fs = read_parquet_with_retry(s3_path)
-        except Exception as e:
-            print(f"{LOG_PREFIX} [ERROR] S3 read failed after retries: {e}")
-            return 0
+        if call_process_file(bucket, key):
+            total_processed += 1
+        else:
+            print(f"{LOG_PREFIX} [ERROR] Failed to process: {source_file}")
 
-        try:
-            total_rows = pf.metadata.num_rows
-            num_rg = pf.metadata.num_row_groups
-            print(f"{LOG_PREFIX}   Rows: {total_rows} | Row groups: {num_rg}")
-
-            row_number = 0
-            batch_buffer = []
-
-            for rg_idx in range(num_rg):
-                table = pf.read_row_group(rg_idx)
-                df = table.to_pandas()
-
-                for _, row in df.iterrows():
-                    msg = {
-                        "version": TRANSFORM_VERSION,
-                        "batch_id": str(batch_id),
-                        "source_file": source_file,
-                        "row_number": row_number,
-                        "record": {
-                            "account_id": str(row.get("account_id", "")),
-                            "asset_id": str(row.get("asset_id", "")),
-                            "reference_date": str(row.get("reference_date", "")),
-                            "quantity": float(row.get("quantity", 0)),
-                            "amount": float(row.get("amount", 0)),
-                        },
-                    }
-                    batch_buffer.append(msg)
-                    row_number += 1
-
-                    if len(batch_buffer) == 10:
-                        ok, fail = send_record_batch(sqs, record_queue_url, batch_buffer)
-                        total_enviados += ok
-                        batch_buffer.clear()
-
-                if batch_buffer:
-                    ok, fail = send_record_batch(sqs, record_queue_url, batch_buffer)
-                    total_enviados += ok
-                    batch_buffer.clear()
-
-                print(f"{LOG_PREFIX}   RG {rg_idx}: sent to SQS #2")
-
-        finally:
-            f.close()
-
-    print(f"{LOG_PREFIX}   Done: {total_enviados} records sent to SQS #2, errors: 0")
-    return total_enviados
+    return total_processed
 
 
 def main():
     print("=" * 60)
-    print(f"{LOG_PREFIX} CONSUMER SQS #1 (Notificacao S3) -> SQS #2 (Registros)")
+    print(f"{LOG_PREFIX} CONSUMER - SNS/SQS -> process_file.py -> Staging")
     print("=" * 60)
 
     sqs = boto3.client(
@@ -191,12 +139,11 @@ def main():
         print(f"{LOG_PREFIX} [ERROR] Queue '{NOTIFICATION_QUEUE}' not found. Run setup_infra.py first.")
         return
 
-    record_queue_url = ensure_record_queue(sqs)
-    print(f"{LOG_PREFIX} SQS #1 (notification): {notif_url}")
-    print(f"{LOG_PREFIX} SQS #2 (records):      {record_queue_url}\n")
+    print(f"{LOG_PREFIX} SQS notification queue: {notif_url}\n")
 
     total_eventos = 0
-    total_registros = 0
+    total_arquivos = 0
+    start_time = time.time()
 
     while True:
         resp = sqs.receive_message(
@@ -208,7 +155,11 @@ def main():
 
         messages = resp.get("Messages", [])
         if not messages:
-            print(f"\n{LOG_PREFIX} Queue empty. Consumer finished.")
+            elapsed = time.time() - start_time
+            if total_eventos > 0:
+                print(f"\n{LOG_PREFIX} Queue empty after {total_eventos} events. Consumer finishing.")
+            else:
+                print(f"\n{LOG_PREFIX} No messages received in {elapsed:.1f}s. Waiting...")
             break
 
         for msg in messages:
@@ -216,19 +167,21 @@ def main():
             try:
                 raw_body = json.loads(msg["Body"])
                 body = unwrap_message(raw_body)
-                enviados = process_event(sqs, record_queue_url, body)
+                arquivos_processados = process_event(body)
                 total_eventos += 1
-                total_registros += enviados
+                total_arquivos += arquivos_processados
 
                 sqs.delete_message(QueueUrl=notif_url, ReceiptHandle=receipt)
-                print(f"{LOG_PREFIX} [OK] Notification processed. {enviados} records sent to SQS #2")
+                print(f"{LOG_PREFIX} [OK] S3 event processed, {arquivos_processados} file(s) bulk-inserted")
 
             except Exception as e:
                 print(f"{LOG_PREFIX} [ERROR] Failed to process event: {e}")
 
+    elapsed = time.time() - start_time
     print(f"\n=== {LOG_PREFIX} SUMMARY ===")
-    print(f"  S3 events processed:  {total_eventos}")
-    print(f"  Records sent to SQS #2: {total_registros}")
+    print(f"  S3 events processed: {total_eventos}")
+    print(f"  Files bulk-inserted: {total_arquivos}")
+    print(f"  Elapsed time: {elapsed:.1f}s")
 
 
 if __name__ == "__main__":

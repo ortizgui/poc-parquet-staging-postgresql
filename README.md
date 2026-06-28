@@ -58,26 +58,56 @@ flowchart TD
 7. Principal: Dados disponíveis para aplicações
 ```
 
-## Tabelas
-
-| Tabela | Função |
-|--------|--------|
-| `custody_position_staging` | Landing zone para dados do parquet |
-| `custody_position_error` | Registros inválidos (com razão do erro) |
-| `custody_position` | Tabela final de produção |
-
 ## Scripts Disponíveis
 
 | Script | Função |
 |--------|--------|
-| `process_file.py` | Lê parquet do S3 e insere na staging |
+| `process_file.py` | Lê parquet do S3 e insere na staging (bulk insert) |
 | `merge_staging.py` | Merge da staging para principal (batch + throttle) |
-| `simulate_load.py` | Simula carga para validação |
+| `simulate_load.py` | Simula carga para validação (testa só o merge) |
 | `generate_report.py` | Gera relatório HTML das métricas |
 | `seed_database.py` | Preenche base com dados de teste |
 | `setup_infra.py` | Cria infraestrutura S3/SNS/SQS no LocalStack |
+| `consume_s3_event.py` | Consumer que polling SQS e chama process_file.py |
+| `generate_parquets.py` | Gera múltiplos arquivos Parquet e sobe para S3 |
+| `simulate_s3_notification.py` | Simula notificação SNS (S3 Event) |
 
-## Uso
+## Teste Completo End-to-End
+
+### Teste Aurora-like (40 arquivos)
+
+```bash
+./run_complete_test.sh --files 40 --records-per-file 5000 --existing 100000 --batch 2000 --delay 0.5
+```
+
+**Resultado**: 40 arquivos × 5.000 registros = **200.000 registros** totais
+
+Parametros:
+- `--files 40`: 40 arquivos Parquet
+- `--records-per-file 5000`: 5.000 registros por arquivo
+- `--existing 100000`: 100k registros ja existentes na tabela principal
+- `--batch 2000`: batch size do merge (sweet spot identificado)
+- `--delay 0.5`: delay entre batches (sweet spot para throttle)
+
+### Teste Rápido (10 arquivos)
+
+```bash
+./run_complete_test.sh --files 10 --records-per-file 5000 --existing 100000
+```
+
+### Opções do run_complete_test.sh
+
+| Opção | Default | Descrição |
+|-------|---------|-----------|
+| `--files` | 10 | Número de arquivos Parquet |
+| `--records-per-file` | 5000 | Registros por arquivo |
+| `--existing` | 100000 | Registros existentes na base |
+| `--batch` | 2000 | Batch size do merge |
+| `--delay` | 0.5 | Delay entre batches (segundos) |
+| `--keep-docker` | false | Não recria Docker (mais rápido) |
+| `--output` | metrics_*.csv | Arquivo CSV de saída |
+
+## Uso Individual
 
 ### 1. Setup
 
@@ -85,25 +115,21 @@ flowchart TD
 # Subir serviços
 docker compose up -d
 
-# Criar tabelas
-psql -h localhost -U pocuser -d pocdb -f sql/001_init.sql
-
 # Setup infraestrutura (S3, SNS, SQS)
 python3 scripts/setup_infra.py
 ```
 
-### 2. Processar arquivo Parquet (ECS/Consumer)
+### 2. Gerar e processar Parquets
 
 ```bash
-# Gerar arquivo de exemplo
-python3 scripts/create_sample_file.py
-python3 scripts/upload_to_s3.py
+# Gerar múltiplos arquivos Parquet e subir para S3
+python3 scripts/generate_parquets.py --count 10 --records-per-file 5000
 
-# Simular notificação SNS
-python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
+# Simular notificação SNS para cada arquivo
+python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_xxxx.parquet
 
-# Processar parquet (insere na staging)
-python3 scripts/process_file.py --bucket poc-bucket --key input/custody_position.parquet
+# OU: rodar o consumer que polling SQS automaticamente
+python3 scripts/consume_s3_event.py
 ```
 
 ### 3. Merge para tabela principal (Cron)
@@ -116,7 +142,7 @@ python3 scripts/merge_staging.py
 MERGE_BATCH_SIZE=2000 MERGE_DELAY_SECONDS=0.5 python3 scripts/merge_staging.py
 ```
 
-### 4. Simular carga de produção
+### 4. Simular carga de produção (apenas merge)
 
 ```bash
 python3 scripts/simulate_load.py \
@@ -136,6 +162,16 @@ python3 scripts/generate_report.py metrics.csv
 
 ## Parâmetros
 
+### run_complete_test.sh
+
+| Variável | Default | Descrição |
+|----------|---------|-----------|
+| `--files` | 10 | Número de arquivos Parquet |
+| `--records-per-file` | 5000 | Registros por arquivo |
+| `--existing` | 100000 | Registros existentes na base |
+| `--batch` | 2000 | Batch size do merge |
+| `--delay` | 0.5 | Delay entre batches (segundos) |
+
 ### simulate_load.py
 
 | Parâmetro | Default | Descrição |
@@ -154,22 +190,13 @@ python3 scripts/generate_report.py metrics.csv
 | `MERGE_BATCH_SIZE` | 2000 | Registros por batch |
 | `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches |
 
-## Métricas e Relatórios
+### generate_parquets.py
 
-O `simulate_load.py` gera um CSV com métricas que pode ser convertido em relatório HTML:
-
-```bash
-# Gerar relatório
-python3 scripts/generate_report.py metrics.csv
-
-# Abrir no navegador
-open metrics_report.html
-```
-
-O relatório inclui:
-- Resumo de métricas (total registros, throughput, tempo)
-- Gráficos de performance
-- Status de lock e dead tuples
+| Parâmetro | Default | Descrição |
+|-----------|---------|-----------|
+| `--count` | 10 | Número de arquivos Parquet |
+| `--records-per-file` | 5000 | Registros por arquivo |
+| `--prefix` | input/ | Prefixo da chave S3 |
 
 ## Merge Staging (merge_staging.py)
 
@@ -212,6 +239,15 @@ Para cada batch:
 |-----------|-------------|--------------|
 | r6g.xlarge (4 vCPU, 32GB) | ~12 min | ~46 min |
 
+### Teste Completo (40 arquivos × 5000 registros)
+
+| Métrica | Valor |
+|---------|-------|
+| Total Records | 200.000 |
+| Throughput | ~3,000 regs/s |
+| Batch Size | 2000 |
+| Delay | 0.5s |
+
 ## Padrões de Resiliencia
 
 ### Idempotência
@@ -229,39 +265,10 @@ Para cada batch:
 - Registros inválidos vão para `custody_position_error`
 - Payload JSONB preserva dados originais para investigação
 
-## Setup Local
-
-```bash
-# Subir servicos
-docker compose up -d
-
-# Criar tabelas
-psql -h localhost -U pocuser -d pocdb -f sql/001_init.sql
-
-# Setup infraestrutura (S3, SNS, SQS)
-python3 scripts/setup_infra.py
-
-# Gerar e subir parquet
-python3 scripts/create_sample_file.py
-python3 scripts/upload_to_s3.py
-
-# Simular notificação
-python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
-
-# Processar parquet
-python3 scripts/process_file.py --bucket poc-bucket --key input/custody_position.parquet
-
-# Merge
-python3 scripts/merge_staging.py
-
-# Simular carga
-python3 scripts/simulate_load.py --existing-records 500000 --ingestion-size 1000000 --update-ratio 60
-```
-
 ## Stack
 
 | Componente | Tecnologia |
-|------------|-----------|
+|------------|------------|
 | Database | PostgreSQL 16 |
 | Object Storage | AWS S3 (LocalStack) |
 | Notifications | AWS SNS |

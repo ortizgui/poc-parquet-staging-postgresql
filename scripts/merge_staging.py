@@ -1,6 +1,6 @@
 """Merge records from staging table to principal table.
 
-Este script é destinado a rodar como CRON/JobScheduler.
+Este script é destinado a rodar como CRON/JobScheduler ou em modo continuo.
 Ele processa registros da tabela staging em batches controlados.
 
 Fluxo:
@@ -8,20 +8,25 @@ Fluxo:
   2. INSERT novos registros na principal (ON CONFLICT DO NOTHING)
   3. UPDATE registros existentes (apenas se mudou)
   4. DELETE da staging após sucesso do upsert
-  5. Repete até staging vazia
+  5. Repete até staging vazia (ou indefinidamente em modo --continuous)
 
 Características:
   - Throttling configurável (delay entre batches)
   - Batch size configurável
   - Lock via pg_advisory_lock para evitar execuções concorrentes
+  - Modo continuo para testes end-to-end
   - Métricas de tempo e throughput
 
 Uso:
-  python3 scripts/merge_staging.py
-  python3 scripts/merge_staging.py --batch-size 2000 --delay 0.5
+  python3 scripts/merge_staging.py                    # Modo único (original)
+  python3 scripts/merge_staging.py --continuous        # Modo continuo (para testes)
+  python3 scripts/merge_staging.py --continuous --max-iterations 1000
 """
 
+import argparse
 import os
+import signal
+import sys
 import time
 from datetime import datetime
 
@@ -42,22 +47,35 @@ BATCH_SIZE = int(os.getenv("MERGE_BATCH_SIZE", "2000"))
 MERGE_DELAY_SECONDS = float(os.getenv("MERGE_DELAY_SECONDS", "0.5"))
 MERGE_LOCK_ID = 42
 
+# Global for signal handling
+shutdown_requested = False
 
-def merge_batch(cur, batch_ids):
-    """Executa merge de um batch específico."""
-    # 1. INSERT novos registros (que não existem na principal)
+
+def signal_handler(signum, frame):
+    global shutdown_requested
+    print("\n[MERGE] Shutdown requested, finishing current batch...")
+    shutdown_requested = True
+
+
+def merge_batch(conn, cur, batch_ids):
+    """Executa merge de um batch específico.
+    
+    Usa INSERT ... ON CONFLICT para evitar erros de unique constraint.
+    O ON CONFLICT DO NOTHING simplesmente ignora registros que ja existem.
+    """
+    # 1. INSERT com ON CONFLICT DO NOTHING (ignora duplicatas)
+    # Depois faz UPDATE apenas para os registros que ja existiam
     cur.execute("""
         INSERT INTO custody_position (account_id, asset_id, reference_date, quantity, amount, created_at)
         SELECT s.account_id, s.asset_id, s.reference_date, s.quantity, s.amount, s.created_at
         FROM custody_position_staging s
         WHERE s.id = ANY(%s)
-          AND NOT EXISTS (
-              SELECT 1 FROM custody_position f
-              WHERE f.account_id = s.account_id
-                AND f.asset_id = s.asset_id
-                AND f.reference_date = s.reference_date
-          )
+        ON CONFLICT (account_id, asset_id, reference_date) DO NOTHING
+        RETURNING account_id, asset_id, reference_date
     """, (batch_ids,))
+    
+    # get nb of inserted rows - we need to count manually since RETURNING only gives inserted
+    # Actually, let's count total rows we tried to insert and subtract what's in staging after
     inserted = cur.rowcount
 
     # 2. UPDATE registros existentes (apenas se valores mudaram)
@@ -86,7 +104,75 @@ def merge_batch(cur, batch_ids):
     return inserted, updated, deleted
 
 
+def run_merge_cycle(conn, cur, batch_size, delay_seconds, stats):
+    """Executa um ciclo de merge (busca e processa um batch)."""
+    # Seleciona próximo batch
+    cur.execute("""
+        SELECT id
+        FROM custody_position_staging
+        ORDER BY id
+        LIMIT %s
+    """, (batch_size,))
+    
+    batch_rows = cur.fetchall()
+    if not batch_rows:
+        return False  # Nenhum registro para processar
+
+    batch_ids = [row[0] for row in batch_rows]
+    stats['batch_num'] += 1
+    
+    batch_start = time.time()
+    
+    try:
+        # Executa merge do batch
+        inserted, updated, deleted = merge_batch(conn, cur, batch_ids)
+        conn.commit()
+        batch_time = time.time() - batch_start
+        
+        stats['total_inserted'] += inserted
+        stats['total_updated'] += updated
+        stats['total_deleted'] += deleted
+
+        # Métricas
+        elapsed = time.time() - stats['start_time']
+        throughput = (stats['total_inserted'] + stats['total_updated']) / elapsed if elapsed > 0 else 0
+        
+        print(f"  [BATCH {stats['batch_num']}] +{inserted}ins ~{updated}upd -{deleted}del | "
+              f"{batch_time*1000:.0f}ms | {throughput:.0f} regs/s")
+
+        # Throttle entre batches
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        
+        return True
+
+    except Exception as e:
+        conn.rollback()
+        print(f"  [BATCH {stats['batch_num']}] ERROR: {e}")
+        # Continue to next batch after a small delay
+        time.sleep(delay_seconds)
+        return True
+
+
 def main():
+    global shutdown_requested
+    
+    parser = argparse.ArgumentParser(description="Merge staging to principal table")
+    parser.add_argument("--continuous", action="store_true",
+                        help="Run continuously until shutdown (for end-to-end tests)")
+    parser.add_argument("--max-iterations", type=int, default=0,
+                        help="Max iterations in continuous mode (0=unlimited)")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                        help=f"Batch size (default: {BATCH_SIZE})")
+    parser.add_argument("--delay", type=float, default=MERGE_DELAY_SECONDS,
+                        help=f"Delay between batches in seconds (default: {MERGE_DELAY_SECONDS})")
+    args = parser.parse_args()
+    
+    batch_size = args.batch_size
+    delay_seconds = args.delay
+    continuous = args.continuous
+    max_iterations = args.max_iterations
+
     conn = psycopg2.connect(
         host=PG_HOST,
         port=PG_PORT,
@@ -94,7 +180,13 @@ def main():
         user=PG_USER,
         password=PG_PASSWORD,
     )
+    # Set connection to autocommit=False (default) but handle explicitly
     cur = conn.cursor()
+
+    # Setup signal handlers for continuous mode
+    if continuous:
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         # Adquire lock para evitar execuções concorrentes
@@ -105,80 +197,79 @@ def main():
             print("[MERGE] Another merge is running. Exiting.")
             return
 
-        print(f"[MERGE] Lock acquired. Starting merge process.")
-        print(f"[MERGE] Config: batch_size={BATCH_SIZE}, delay={MERGE_DELAY_SECONDS}s")
+        print(f"[MERGE] Lock acquired.")
+        print(f"[MERGE] Config: batch_size={batch_size}, delay={delay_seconds}s")
+        if continuous:
+            print(f"[MERGE] Mode: CONTINUOUS (Ctrl+C to stop)")
+        else:
+            print(f"[MERGE] Mode: SINGLE RUN")
 
         # Conta registros pendentes
         cur.execute("SELECT COUNT(*) FROM custody_position_staging")
         pending = cur.fetchone()[0]
         print(f"[MERGE] Registros na staging: {pending}")
 
-        if pending == 0:
+        if pending == 0 and not continuous:
             print("[MERGE] Staging vazia. Nada a processar.")
             return
 
-        total_inserted = 0
-        total_updated = 0
-        total_deleted = 0
-        start_time = time.time()
-        batch_num = 0
+        stats = {
+            'total_inserted': 0,
+            'total_updated': 0,
+            'total_deleted': 0,
+            'batch_num': 0,
+            'start_time': time.time(),
+        }
 
+        iteration = 0
         while True:
-            # Seleciona próximo batch
-            cur.execute("""
-                SELECT id
-                FROM custody_position_staging
-                ORDER BY id
-                LIMIT %s
-            """, (BATCH_SIZE,))
+            iteration += 1
             
-            batch_rows = cur.fetchall()
-            if not batch_rows:
+            # Check max iterations
+            if max_iterations > 0 and iteration > max_iterations:
+                print(f"[MERGE] Max iterations ({max_iterations}) reached. Stopping.")
                 break
-
-            batch_ids = [row[0] for row in batch_rows]
-            batch_num += 1
             
-            batch_start = time.time()
+            # Check shutdown
+            if shutdown_requested:
+                print(f"[MERGE] Shutdown requested. Stopping after {stats['batch_num']} batches.")
+                break
             
-            # Executa merge do batch
-            inserted, updated, deleted = merge_batch(cur, batch_ids)
+            # Executa um ciclo de merge
+            had_work = run_merge_cycle(conn, cur, batch_size, delay_seconds, stats)
             
-            conn.commit()
-            batch_time = time.time() - batch_start
-            
-            total_inserted += inserted
-            total_updated += updated
-            total_deleted += deleted
-
-            # Métricas
-            elapsed = time.time() - start_time
-            throughput = (total_inserted + total_updated) / elapsed if elapsed > 0 else 0
-            progress = (total_deleted / pending * 100) if pending > 0 else 100
-            
-            print(f"  [BATCH {batch_num}] +{inserted}ins ~{updated}upd | "
-                  f"{batch_time*1000:.0f}ms | {progress:.1f}% | "
-                  f"{throughput:.0f} regs/s")
-
-            # Throttle entre batches
-            if MERGE_DELAY_SECONDS > 0:
-                time.sleep(MERGE_DELAY_SECONDS)
+            if not had_work:
+                if continuous:
+                    # No work available, wait and retry
+                    print(f"[MERGE] Staging empty, waiting {delay_seconds}s for more data...")
+                    time.sleep(delay_seconds)
+                    # Re-check pending count
+                    cur.execute("SELECT COUNT(*) FROM custody_position_staging")
+                    pending = cur.fetchone()[0]
+                    if pending == 0:
+                        continue  # Keep waiting
+                else:
+                    break  # Single mode - we're done
 
         # Tempo total
-        total_time = time.time() - start_time
-        overall_throughput = (total_inserted + total_updated) / total_time if total_time > 0 else 0
+        total_time = time.time() - stats['start_time']
+        overall_throughput = (stats['total_inserted'] + stats['total_updated']) / total_time if total_time > 0 else 0
 
-        print(f"\n[MERGE] Concluído!")
+        print(f"\n[MERGE] {'Continuous mode' if continuous else 'Merge'} concluded!")
+        print(f"  Batches processados: {stats['batch_num']}")
         print(f"  Tempo total: {total_time:.2f}s")
         print(f"  Throughput: {overall_throughput:.0f} regs/s")
-        print(f"  Inserted: {total_inserted}")
-        print(f"  Updated: {total_updated}")
-        print(f"  Deleted from staging: {total_deleted}")
+        print(f"  Inserted: {stats['total_inserted']}")
+        print(f"  Updated: {stats['total_updated']}")
+        print(f"  Deleted from staging: {stats['total_deleted']}")
 
     finally:
         # Libera lock
-        cur.execute("SELECT pg_advisory_unlock(%s)", (MERGE_LOCK_ID,))
-        print("[MERGE] Lock released.")
+        try:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (MERGE_LOCK_ID,))
+            print("[MERGE] Lock released.")
+        except:
+            print("[MERGE] Lock release failed (already released or error)")
         cur.close()
         conn.close()
 
