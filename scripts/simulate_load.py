@@ -250,13 +250,14 @@ def main():
     
     # Generate update records (using existing combos)
     source_file = f"sim_{uuid.uuid4().hex[:8]}.parquet"
+    batch_uuid = uuid.uuid4()
     update_records = []
     for i, combo in enumerate(existing_combos):
         account_id, asset_id, reference_date = combo
         quantity = round(random.uniform(10, 10000), 4)
         amount = round(random.uniform(100, 1000000), 2)
         record_hash = uuid.uuid4().hex[:16]
-        update_records.append((uuid.UUID(source_file), source_file, i + 1, record_hash,
+        update_records.append((batch_uuid, source_file, i + 1, record_hash,
                               account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
 
     # Generate insert records (new combos)
