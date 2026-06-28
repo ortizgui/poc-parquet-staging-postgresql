@@ -379,19 +379,34 @@ def generate_report(csv_file, output_file=None):
             <div class="section-title">📉 Gráficos</div>
             <div class="charts-grid">
                 <div class="chart-card">
-                    <h3>📈 Throughput over Time</h3>
+                    <h3>
+                        <span style="display: flex; align-items: center; gap: 6px;">
+                            📈 Throughput over Time
+                            <span class="info-icon" data-tooltip="Mostra o throughput (registros/segundo) calculado para cada batch ao longo do tempo" onmouseenter="showTooltip(this)" onmouseleave="hideTooltip(this)">ℹ️</span>
+                        </span>
+                    </h3>
                     <div class="chart-container">
                         <canvas id="chart-throughput"></canvas>
                     </div>
                 </div>
                 <div class="chart-card">
-                    <h3>📊 Inserted vs Updated</h3>
+                    <h3>
+                        <span style="display: flex; align-items: center; gap: 6px;">
+                            📊 Inserted vs Updated
+                            <span class="info-icon" data-tooltip="Compara a quantidade de registros inseridos vs atualizados por batch" onmouseenter="showTooltip(this)" onmouseleave="hideTooltip(this)">ℹ️</span>
+                        </span>
+                    </h3>
                     <div class="chart-container">
                         <canvas id="chart-inserted-updated"></canvas>
                     </div>
                 </div>
                 <div class="chart-card">
-                    <h3>⏱️ Batch Time</h3>
+                    <h3>
+                        <span style="display: flex; align-items: center; gap: 6px;">
+                            ⏱️ Batch Time
+                            <span class="info-icon" data-tooltip="Tempo de execução de cada batch em milissegundos" onmouseenter="showTooltip(this)" onmouseleave="hideTooltip(this)">ℹ️</span>
+                        </span>
+                    </h3>
                     <div class="chart-container">
                         <canvas id="chart-batch-time"></canvas>
                     </div>
