@@ -121,7 +121,7 @@ docker compose up -d
 docker compose ps
 
 # Criar e ativar ambiente Python (para scripts locais, opcional)
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -130,25 +130,25 @@ pip install -r requirements.txt
 
 ```bash
 # 1. Gerar arquivo Parquet de exemplo
-python scripts/create_sample_file.py
+python3 scripts/create_sample_file.py
 
 # 2. Enviar para S3 local
-python scripts/upload_to_s3.py
+python3 scripts/upload_to_s3.py
 
 # 3. Setup da infraestrutura (SNS, SQS, DLQs, subscriptions)
-python scripts/setup_infra.py
+python3 scripts/setup_infra.py
 
 # 4. Simular S3 Event Notification -> SNS -> SQS #1
-python scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
+python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
 
 # 5. ECS Service 1: SQS #1 -> Parquet -> SQS #2
-python scripts/consume_s3_event.py
+python3 scripts/consume_s3_event.py
 
 # 6. ECS Service 2: SQS #2 -> Buffer table
-python scripts/consume_records_to_db.py
+python3 scripts/consume_records_to_db.py
 
 # 7. Merge Buffer -> Final table
-python scripts/merge_buffer.py
+python3 scripts/merge_buffer.py
 ```
 
 ### Execucao com Docker Compose
@@ -262,4 +262,369 @@ MERGE_DELAY_SECONDS=0.5
 # Para teste de velocidade (sem throttle)
 MERGE_BATCH_SIZE=10000
 MERGE_DELAY_SECONDS=0
+```
+
+## Load Simulation Tool
+
+Ferramenta para simular carga de produção e validar configurações de merge antes de deploy.
+
+### Scripts Disponíveis
+
+| Script | Função |
+|--------|--------|
+| `scripts/seed_database.py` | Preenche tabela principal com dados base |
+| `scripts/simulate_load.py` | Executa simulação completa com métricas |
+
+### Parâmetros
+
+| Parâmetro | Default | Descrição |
+|-----------|---------|-----------|
+| `--existing-records` | 100000 | Registros já existentes na tabela principal |
+| `--ingestion-size` | 10000 | Quantidade de registros para ingestação (tamanho do bulk) |
+| `--update-ratio` | 60 | % de registros que atualizarão dados existentes |
+| `--batch-size` | 2000 | Tamanho do batch de merge |
+| `--delay` | 0.5 | Delay entre batches (segundos) |
+| `--concurrent-ops` | 0 | Simular N operações simultâneas por segundo durante merge |
+| `--output-csv` | "" | Arquivo CSV para salvar métricas (opcional) |
+
+### Entendendo os Parâmetros
+
+**`--ingestion-size`**: Representa o tamanho do bulk insert na tabela staging (buffer). 
+- 1M = bulk de 1 milhão de registros
+- Quanto maior, mais tempo o merge ficará rodando
+
+**`--update-ratio`**: Percentual de registros que farão UPDATE vs INSERT
+- 60% = 60% dos registros têm chave já existente na tabela principal
+- 40% = 40% são registros novos (INSERT)
+
+**`--batch-size`**: Quantidade de registros processados por transação no merge
+- Batch menor = menos lock por transação = mais suave para o BD
+- Batch maior = mais throughput, mas mais lock contention
+
+**`--delay`**: Pausa entre batches para permitir outras operações passarem
+- 0.5s = pausa de 500ms entre batches (recomendado para produção)
+- 0 = sem pausa (teste de performance máxima)
+
+**`--concurrent-ops`**: Simula operações concorrentes de outras aplicações
+- 0 = sem concorrência (teste isolado)
+- 5-10 = uso normal de outras aplicações
+- 50+ = pico de processamento, outras aplicações tentando escrever
+
+### Uso Básico
+
+```bash
+# Simular carga simples (já faz seed automático)
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 100000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5
+
+# Simular carga com operações concorrentes (teste de impacto)
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 1000000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5 \
+    --concurrent-ops 50
+
+# Salvar métricas em CSV para análise
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 1000000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5 \
+    --concurrent-ops 50 \
+    --output-csv metrics_test.csv
+```
+
+**Nota:** `simulate_load.py` sempre trunca e re-seda a tabela principal antes da simulação,
+garantindo estado limpo. `seed_database.py` também sempre trunca antes de inserir.
+
+### Cenários de Teste Recomendados
+
+```bash
+# Teste leve (validação rápida)
+python3 scripts/simulate_load.py \
+    --existing-records 10000 \
+    --ingestion-size 1000 \
+    --update-ratio 60
+
+# Teste médio (1M registros, 5 ops/s concorrência)
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 1000000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5 \
+    --concurrent-ops 5
+
+# Teste agressivo (1M registros, 50 ops/s concorrência)
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 1000000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5 \
+    --concurrent-ops 50
+
+# Teste de performance máxima (sem throttle)
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 1000000 \
+    --update-ratio 60 \
+    --batch-size 5000 \
+    --delay 0
+```
+
+### Métricas Coletadas
+
+#### Timing Results
+- **Total Time**: Tempo total do merge em segundos
+- **Throughput**: Registros processados por segundo
+
+#### Concurrent Operations Impact
+- **Total ops attempted**: Total de operações concorrentes executadas
+- **Errors**: Número de operações que falharam
+- **Avg/Max/P95 latency**: Latência das operações concorrentes
+
+#### Estimated Aurora Performance
+- **r6g.large (2 vCPU, 16GB)**: Estimativa para instância menor
+- **r6g.xlarge (4 vCPU, 32GB)**: Estimativa para instância maior
+- Proporção baseada em: throughput_local × (vCPUs_Aurora / vCPUs_local) × 0.8
+
+#### Database State
+- **Dead tuples**: Tuplas mortas na tabela (normais após UPDATEs)
+- **Connections**: Conexões ativas no momento
+- **Pending locks**: Locks aguardando (0 = sem lock contention)
+- **Cache hit ratio**: Percentual de acerto de cache (>95% = bom)
+
+### Resultado dos Testes Realizados
+
+#### Teste 1: 5 ops/s concorrência
+
+```bash
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 1000000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5 \
+    --concurrent-ops 5
+```
+
+**Resultados:**
+| Métrica | Valor |
+|---------|-------|
+| Total Time | 297.87s (~5 min) |
+| Throughput | 3,021 regs/s |
+| Errors | 0 |
+| P95 Latency | 81.0ms |
+| Pending Locks | 0 |
+
+**Estimativa Aurora r6g.xlarge:**
+- 1M registros → 12 min
+- 4M registros → 48 min
+
+#### Teste 2: 50 ops/s concorrência
+
+```bash
+python3 scripts/simulate_load.py \
+    --existing-records 500000 \
+    --ingestion-size 1000000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5 \
+    --concurrent-ops 50
+```
+
+**Resultados:**
+| Métrica | Valor |
+|---------|-------|
+| Total Time | 290.63s (~5 min) |
+| Throughput | 3,097 regs/s |
+| Errors | 0 |
+| P95 Latency | 59.9ms |
+| Pending Locks | 0 |
+| Cache Hit Ratio | 94.51% |
+
+**Estimativa Aurora r6g.xlarge:**
+- 1M registros → 12 min
+- 4M registros → 46 min
+
+### Interpretação dos Resultados
+
+**Impacto Baixo = Bom para Produção**
+- Errors = 0: Operações concorrentes não falharam
+- Pending Locks = 0: Não há lock contention
+- P95 Latency < 100ms: Tempo de resposta aceitável
+
+**Fatores que Afetam Throughput**
+1. Batch size maior = mais throughput (mas mais lock)
+2. Delay menor = mais throughput (mas mais impacto)
+3. Concorrência alta = pode reduzir throughput (lock contention)
+
+**Recomendação para 4kk em 30 minutos**
+- Aurora r6g.xlarge: ~46 min (acima do alvo)
+- Aurora r6g.2xlarge (8 vCPU): ~23 min (dentro do alvo)
+
+### Geração de Gráficos
+
+Para gerar gráficos a partir do CSV:
+
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.read_csv('metrics_test.csv')
+
+# Gráfico de locks ao longo do tempo
+plt.figure(figsize=(12, 6))
+plt.plot(df['timestamp'], df['pending_locks'], label='Pending Locks')
+plt.xlabel('Tempo (s)')
+plt.ylabel('Locks')
+plt.title('Locks durante Merge')
+plt.legend()
+plt.grid(True)
+plt.savefig('locks_chart.png')
+
+# Gráfico de dead tuples
+plt.figure(figsize=(12, 6))
+plt.plot(df['timestamp'], df['dead_custody'], label='Dead Tuples (custody_position)')
+plt.plot(df['timestamp'], df['dead_buffer'], label='Dead Tuples (buffer)')
+plt.xlabel('Tempo (s)')
+plt.ylabel('Dead Tuples')
+plt.title('Acúmulo de Dead Tuples durante Merge')
+plt.legend()
+plt.grid(True)
+plt.savefig('dead_tuples_chart.png')
+```
+## Scripts Disponíveis
+
+| Script | Função |
+|--------|--------|
+| `scripts/seed_database.py` | Preenche tabela principal com dados base |
+| `scripts/simulate_load.py` | Executa simulação completa com métricas |
+
+### Uso Básico
+
+```bash
+# Simular carga (já faz seed automático da tabela principal)
+python3 scripts/simulate_load.py \
+    --existing-records 100000 \
+    --ingestion-size 10000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5
+
+# Ou seedar manualmente a tabela principal primeiro
+python3 scripts/seed_database.py --records 100000
+```
+
+**Nota:** `simulate_load.py` sempre trunca e re-seda a tabela principal antes da simulação,
+garantindo estado limpo. `seed_database.py` também sempre trunca antes de inserir.
+
+### Parâmetros
+
+| Parâmetro | Default | Descrição |
+|-----------|---------|-----------|
+| `--existing-records` | 100000 | Registros já existentes na tabela principal |
+| `--ingestion-size` | 10000 | Quantidade de registros para ingestação |
+| `--update-ratio` | 60 | % de registros que atualizarão dados existentes |
+| `--batch-size` | 2000 | Tamanho do batch de merge |
+| `--delay` | 0.5 | Delay entre batches (segundos) |
+| `--accounts` | 1000 | Quantidade de contas únicas para gerar |
+
+### Exemplo de Saída
+
+```
+============================================================
+=== LOAD SIMULATION REPORT ===
+Date: 2025-01-15 10:30:00
+Existing Records: 100,000
+Ingestion Size: 10,000 (60% updates, 40% inserts)
+Batch Size: 2,000
+Delay: 0.5s
+
+=== RESULTS ===
+Total Time: 45.234s
+Throughput: 221.1 records/second
+Batches: 5
+Per-batch breakdown:
+  - Batch 1: 1200 ins, 800 upd - 8.123s
+  - Batch 2: 800 ins, 1200 upd - 9.456s
+  - Batch 3: 1200 ins, 800 upd - 8.891s
+  - Batch 4: 800 ins, 1200 upd - 9.123s
+  - Batch 5: 400 ins, 600 upd - 9.641s
+
+=== ESTIMATED PRODUCTION ===
+For 4,000,000 records: 5.0h
+============================================================
+```
+
+### Cenários de Teste Recomendados
+
+```bash
+# Teste leve (rápido para validar funcionamento)
+python3 scripts/simulate_load.py \
+    --existing-records 10000 \
+    --ingestion-size 1000 \
+    --update-ratio 60
+
+# Teste médio (simula proporção real)
+python3 scripts/simulate_load.py \
+    --existing-records 100000 \
+    --ingestion-size 10000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5
+
+# Teste de performance (sem throttle)
+python3 scripts/simulate_load.py \
+    --existing-records 100000 \
+    --ingestion-size 100000 \
+    --update-ratio 60 \
+    --batch-size 10000 \
+    --delay 0
+
+# Teste com diferentes configurações
+for batch in 500 1000 2000 3000 5000; do
+    python scripts/simulate_load.py \
+        --existing-records 50000 \
+        --ingestion-size 5000 \
+        --update-ratio 60 \
+        --batch-size $batch \
+        --delay 0.5
+done
+```
+
+### Estimativa Proporcional
+
+Para estimar tempo em produção (Aurora 36GB), use a proporção:
+
+```
+Tempo local (hardware X) = Tempo medido × (Recursos Aurora / Recursos Local)
+```
+
+Por exemplo, se local processou 10k registros em 45s:
+- Aurora tem ~4x mais CPU e IOPS que ambiente local
+- Estimativa: 45s / 4 = ~11s para 10k registros
+- Para 4kk: 4,000,000 / 10,000 × 11s = ~1.2h
+
+### Coleta de Métricas Adicionais (Opcional)
+
+Para coletar métricas do PostgreSQL durante a simulação, execute em outro terminal:
+
+```bash
+# Monitorar conexões e queries
+watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"'
+
+# Monitorar locks
+watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT * FROM pg_locks WHERE granted=false;"'
+
+# Monitorar tamanho das tabelas
+watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT relname, n_live_tup, n_dead_tup FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;"'
 ```
