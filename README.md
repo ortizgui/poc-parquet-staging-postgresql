@@ -121,7 +121,7 @@ docker compose up -d
 docker compose ps
 
 # Criar e ativar ambiente Python (para scripts locais, opcional)
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -130,25 +130,25 @@ pip install -r requirements.txt
 
 ```bash
 # 1. Gerar arquivo Parquet de exemplo
-python scripts/create_sample_file.py
+python3 scripts/create_sample_file.py
 
 # 2. Enviar para S3 local
-python scripts/upload_to_s3.py
+python3 scripts/upload_to_s3.py
 
 # 3. Setup da infraestrutura (SNS, SQS, DLQs, subscriptions)
-python scripts/setup_infra.py
+python3 scripts/setup_infra.py
 
 # 4. Simular S3 Event Notification -> SNS -> SQS #1
-python scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
+python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
 
 # 5. ECS Service 1: SQS #1 -> Parquet -> SQS #2
-python scripts/consume_s3_event.py
+python3 scripts/consume_s3_event.py
 
 # 6. ECS Service 2: SQS #2 -> Buffer table
-python scripts/consume_records_to_db.py
+python3 scripts/consume_records_to_db.py
 
 # 7. Merge Buffer -> Final table
-python scripts/merge_buffer.py
+python3 scripts/merge_buffer.py
 ```
 
 ### Execucao com Docker Compose
@@ -279,10 +279,10 @@ Ferramenta para simular carga de produção e validar configurações de merge a
 
 ```bash
 # 1. Preencher tabela principal com dados existentes
-python scripts/seed_database.py --records 100000
+python3 scripts/seed_database.py --records 100000
 
 # 2. Executar simulação de carga
-python scripts/simulate_load.py \
+python3 scripts/simulate_load.py \
     --existing-records 100000 \
     --ingestion-size 10000 \
     --update-ratio 60 \
@@ -332,13 +332,13 @@ For 4,000,000 records: 5.0h
 
 ```bash
 # Teste leve (rápido para validar funcionamento)
-python scripts/simulate_load.py \
+python3 scripts/simulate_load.py \
     --existing-records 10000 \
     --ingestion-size 1000 \
     --update-ratio 60
 
 # Teste médio (simula proporção real)
-python scripts/simulate_load.py \
+python3 scripts/simulate_load.py \
     --existing-records 100000 \
     --ingestion-size 10000 \
     --update-ratio 60 \
@@ -346,7 +346,7 @@ python scripts/simulate_load.py \
     --delay 0.5
 
 # Teste de performance (sem throttle)
-python scripts/simulate_load.py \
+python3 scripts/simulate_load.py \
     --existing-records 100000 \
     --ingestion-size 100000 \
     --update-ratio 60 \
