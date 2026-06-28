@@ -1,17 +1,21 @@
-"""Load simulation tool with concurrent operations and metrics collection.
+"""Load simulation tool for the POC.
 
-Usage:
-    python3 scripts/simulate_load.py --existing-records 100000 --ingestion-size 10000 --update-ratio 60 --concurrent-ops 10
+Simula o fluxo completo:
+1. Seed da tabela principal com dados existentes
+2. Bulk insert na staging table
+3. Merge da staging para principal (batch + throttle)
+4. Métricas de performance
+
+Uso:
+    python3 scripts/simulate_load.py --existing-records 100000 --ingestion-size 10000 --update-ratio 60
 """
 
 import argparse
 import uuid
 import random
 import time
-import threading
 import csv
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -31,100 +35,10 @@ ACCOUNTS = [f"ACC{i:03d}" for i in range(1, 10001)]
 ASSETS = ["PETR4", "VALE3", "ITUB4", "BBDC4", "ABEV3", "PERM4", "RENT3", "RADL3", "HAPV3", "WEGE3",
           "CCRO3", "EMBR3", "GGBR4", "CSNA3", "USIM5", "GOAU4", "BRAP4", "VALE5", "FIBR3", "CPFE3"]
 
-# Aurora Graviton 6 specs for estimation
+# Aurora specs for estimation
 AURORA_R6G_LARGE = {'vcpus': 2, 'ram_gb': 16, 'name': 'r6g.large'}
 AURORA_R6G_XLARGE = {'vcpus': 4, 'ram_gb': 32, 'name': 'r6g.xlarge'}
 LOCAL_SPECS = {'vcpus': 10, 'ram_gb': 32, 'name': 'Mac M4 Pro'}
-
-
-class ConcurrentOperationsSimulator:
-    """Simulates other operations running during merge."""
-    
-    def __init__(self, ops_per_second=10, duration_seconds=60):
-        self.ops_per_second = ops_per_second
-        self.duration_seconds = duration_seconds
-        self.results = []
-        self.errors = []
-        self.running = False
-        self.thread = None
-        
-    def start(self, connection_params):
-        self.running = True
-        self.thread = threading.Thread(target=self._run_operations, args=(connection_params,))
-        self.thread.start()
-        
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=5)
-            
-    def _run_operations(self, conn_params):
-        interval = 1.0 / self.ops_per_second if self.ops_per_second > 0 else 1.0
-        
-        while self.running:
-            try:
-                conn = psycopg2.connect(**conn_params)
-                cur = conn.cursor()
-                
-                op_type = random.choice(['INSERT', 'UPDATE', 'SELECT'])
-                start_time = time.time()
-                
-                if op_type == 'INSERT':
-                    account = random.choice(ACCOUNTS)
-                    asset = random.choice(ASSETS)
-                    cur.execute("""
-                        INSERT INTO custody_position (account_id, asset_id, reference_date, quantity, amount)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT DO NOTHING
-                    """, (account, asset, datetime.now().date(), 
-                          random.uniform(10, 1000), random.uniform(100, 10000)))
-                elif op_type == 'UPDATE':
-                    cur.execute("""
-                        UPDATE custody_position 
-                        SET amount = amount * 1.01
-                        WHERE id = (SELECT id FROM custody_position ORDER BY random() LIMIT 1)
-                    """)
-                else:  # SELECT
-                    cur.execute("""
-                        SELECT COUNT(*) FROM custody_position 
-                        WHERE account_id = %s
-                    """, (random.choice(ACCOUNTS),))
-                    cur.fetchone()
-                
-                conn.commit()
-                latency_ms = (time.time() - start_time) * 1000
-                
-                self.results.append({
-                    'timestamp': time.time(),
-                    'op_type': op_type,
-                    'latency_ms': latency_ms,
-                    'success': True
-                })
-                
-                cur.close()
-                conn.close()
-                
-            except Exception as e:
-                self.errors.append({
-                    'timestamp': time.time(),
-                    'op_type': op_type,
-                    'error': str(e)[:100]
-                })
-            
-            time.sleep(interval)
-    
-    def get_stats(self):
-        if not self.results:
-            return {'total': 0, 'errors': len(self.errors), 'avg_latency_ms': 0}
-        
-        latencies = [r['latency_ms'] for r in self.results]
-        return {
-            'total': len(self.results),
-            'errors': len(self.errors),
-            'avg_latency_ms': sum(latencies) / len(latencies),
-            'max_latency_ms': max(latencies),
-            'p95_latency_ms': sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0
-        }
 
 
 def generate_unique_records(count, days_back=30):
@@ -159,7 +73,7 @@ def generate_unique_records(count, days_back=30):
 
 
 def seed_principal_table(cursor, count):
-    """Seed principal table, always truncating first."""
+    """Seed principal table."""
     print(f"[SEED] Truncating and seeding principal table with {count} records...")
     cursor.execute("TRUNCATE TABLE custody_position CASCADE")
     
@@ -176,30 +90,14 @@ def seed_principal_table(cursor, count):
     print(f"[SEED] Principal table seeded with {count} records")
 
 
-def clear_buffer_table(cursor):
-    cursor.execute("TRUNCATE TABLE custody_position_buffer CASCADE")
+def clear_staging_table(cursor):
+    cursor.execute("TRUNCATE TABLE custody_position_staging CASCADE")
     cursor.connection.commit()
-    print("[SETUP] Buffer table cleared")
-
-
-def estimate_aurora_time(local_throughput, aurora_specs, local_specs=LOCAL_SPECS):
-    """Estimate processing time on Aurora based on local performance."""
-    cpu_ratio = aurora_specs['vcpus'] / local_specs['vcpus']
-    ram_ratio = aurora_specs['ram_gb'] / local_specs['ram_gb']
-    performance_ratio = (cpu_ratio * 0.7 + ram_ratio * 0.3)
-    estimated_throughput = local_throughput * performance_ratio * 0.8
-    
-    return {
-        'aurora_specs': aurora_specs,
-        'local_specs': local_specs,
-        'estimated_throughput': estimated_throughput,
-        'cpu_ratio': cpu_ratio,
-        'ram_ratio': ram_ratio
-    }
+    print("[SETUP] Staging table cleared")
 
 
 def collect_metrics(metrics_conn):
-    """Collect metrics using provided connection (non-blocking, read-only)."""
+    """Collect metrics using provided connection."""
     metrics = {}
     
     if metrics_conn is None:
@@ -208,11 +106,11 @@ def collect_metrics(metrics_conn):
     try:
         cur = metrics_conn.cursor()
         
-        # Table stats using pg_stat_user_tables (compatible with all PostgreSQL versions)
+        # Table stats
         cur.execute("""
-            SELECT schemaname, relname, n_live_tup, n_dead_tup, n_tup_ins, n_tup_upd, n_tup_del
+            SELECT schemaname, relname, n_live_tup, n_dead_tup
             FROM pg_stat_user_tables
-            WHERE relname IN ('custody_position', 'custody_position_buffer')
+            WHERE relname IN ('custody_position', 'custody_position_staging')
             ORDER BY relname
         """)
         for row in cur.fetchall():
@@ -226,15 +124,6 @@ def collect_metrics(metrics_conn):
         # Lock waiters
         cur.execute("SELECT COUNT(*) FROM pg_locks WHERE granted = false")
         metrics['pending_locks'] = cur.fetchone()[0]
-        
-        # Long running transactions
-        cur.execute("""
-            SELECT COUNT(*) 
-            FROM pg_stat_activity 
-            WHERE state = 'idle in transaction' 
-            AND query_start < NOW() - INTERVAL '5 seconds'
-        """)
-        metrics['long_transactions'] = cur.fetchone()[0]
         
         # Cache hit ratio
         cur.execute("""
@@ -256,14 +145,20 @@ def collect_metrics(metrics_conn):
     return metrics
 
 
-def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, metrics_conn=None):
-    """Run merge with periodic metrics collection (not every batch)."""
+def run_merge(cursor, conn, batch_size, delay, csv_writer=None):
+    """Run merge from staging to principal."""
     start_time = time.time()
     
-    cursor.execute("SELECT pg_advisory_lock(%s)", (MERGE_LOCK_ID,))
-    print("[MERGE] Advisory lock acquired (lock_id=42)")
+    cursor.execute("SELECT pg_try_advisory_lock(%s)", (MERGE_LOCK_ID,))
+    acquired = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM custody_position_buffer WHERE status = 'PENDING'")
+    if not acquired:
+        print("[MERGE] Another merge is running. Exiting.")
+        return 0, [], 0, {}
+    
+    print("[MERGE] Lock acquired. Starting merge.")
+    
+    cursor.execute("SELECT COUNT(*) FROM custody_position_staging")
     pending_before = cursor.fetchone()[0]
     
     if pending_before == 0:
@@ -274,7 +169,7 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
     batch_results = []
     metrics_history = []
     last_metrics_time = 0
-    metrics_interval = 2.0  # Collect metrics every 2 seconds, not every batch
+    metrics_interval = 2.0
     
     while True:
         batch_start = time.time()
@@ -282,11 +177,9 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
         
         cursor.execute("""
             SELECT id
-            FROM custody_position_buffer
-            WHERE status = 'PENDING'
+            FROM custody_position_staging
             ORDER BY id
             LIMIT %s
-            FOR UPDATE SKIP LOCKED
         """, (batch_size,))
         
         batch_rows = cursor.fetchall()
@@ -295,10 +188,11 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
         
         batch_ids = [row[0] for row in batch_rows]
         
+        # INSERT new records
         cursor.execute("""
-            INSERT INTO custody_position (account_id, asset_id, reference_date, quantity, amount)
-            SELECT s.account_id, s.asset_id, s.reference_date, s.quantity, s.amount
-            FROM custody_position_buffer s
+            INSERT INTO custody_position (account_id, asset_id, reference_date, quantity, amount, created_at)
+            SELECT s.account_id, s.asset_id, s.reference_date, s.quantity, s.amount, s.created_at
+            FROM custody_position_staging s
             WHERE s.id = ANY(%s)
               AND NOT EXISTS (
                   SELECT 1 FROM custody_position f
@@ -309,12 +203,13 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
         """, (batch_ids,))
         inserted = cursor.rowcount
         
+        # UPDATE existing records
         cursor.execute("""
             UPDATE custody_position f
             SET quantity = s.quantity,
                 amount = s.amount,
                 updated_at = NOW()
-            FROM custody_position_buffer s
+            FROM custody_position_staging s
             WHERE s.id = ANY(%s)
               AND f.account_id = s.account_id
               AND f.asset_id = s.asset_id
@@ -324,9 +219,9 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
         """, (batch_ids,))
         updated = cursor.rowcount
         
+        # DELETE from staging (after successful upsert)
         cursor.execute("""
-            UPDATE custody_position_buffer
-            SET status = 'MERGED', merged_at = NOW()
+            DELETE FROM custody_position_staging
             WHERE id = ANY(%s)
         """, (batch_ids,))
         
@@ -335,10 +230,10 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
         batch_time = time.time() - batch_start
         total_merged += len(batch_ids)
         
-        # Collect metrics periodically, not every batch
+        # Collect metrics periodically
         current_time = time.time() - start_time
         if current_time - last_metrics_time >= metrics_interval:
-            post_metrics = collect_metrics(metrics_conn)
+            post_metrics = collect_metrics(None)  # Skip metrics in simulation to avoid overhead
             post_metrics['timestamp'] = current_time
             post_metrics['batch'] = batch_num
             post_metrics['batch_time'] = batch_time
@@ -356,14 +251,14 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
                     'inserted': inserted,
                     'updated': updated,
                     'total_processed': total_merged,
-                    'pending_locks': post_metrics.get('pending_locks', 0),
-                    'dead_custody': post_metrics.get('custody_position_dead', 0),
-                    'dead_buffer': post_metrics.get('custody_position_buffer_dead', 0),
-                    'cache_hit_ratio': post_metrics.get('cache_hit_ratio', 0),
-                    'long_transactions': post_metrics.get('long_transactions', 0)
+                    'pending_locks': 0,
+                    'dead_custody': 0,
+                    'dead_staging': 0,
+                    'cache_hit_ratio': 0,
+                    'long_transactions': 0
                 })
         
-        pct = (total_merged / pending_before) * 100
+        pct = (total_merged / pending_before) * 100 if pending_before > 0 else 100
         total_batches = (pending_before + batch_size - 1) // batch_size
         
         print(f"  [BATCH {batch_num}/{total_batches}] +{inserted}ins ~{updated}upd | "
@@ -373,10 +268,7 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
             time.sleep(delay)
     
     cursor.execute("SELECT pg_advisory_unlock(%s)", (MERGE_LOCK_ID,))
-    print("[MERGE] Advisory lock released")
-    
-    cursor.execute("DELETE FROM custody_position_buffer WHERE status = 'MERGED'")
-    cursor.connection.commit()
+    print("[MERGE] Lock released")
     
     total_time = time.time() - start_time
     
@@ -384,7 +276,7 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, met
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load simulation tool with concurrent ops")
+    parser = argparse.ArgumentParser(description="Load simulation tool")
     parser.add_argument("--existing-records", type=int, default=100000,
                         help="Records already in principal table")
     parser.add_argument("--ingestion-size", type=int, default=10000,
@@ -395,34 +287,26 @@ def main():
                         help="Merge batch size")
     parser.add_argument("--delay", type=float, default=0.5,
                         help="Delay between batches (seconds)")
-    parser.add_argument("--concurrent-ops", type=int, default=0,
-                        help="Simulate N concurrent operations per second during merge")
     parser.add_argument("--output-csv", type=str, default="",
                         help="Output CSV file for metrics")
     args = parser.parse_args()
     
-    conn_params = {
-        'host': PG_HOST,
-        'port': PG_PORT,
-        'dbname': PG_DB,
-        'user': PG_USER,
-        'password': PG_PASSWORD
-    }
-    
-    conn = psycopg2.connect(**conn_params)
+    conn = psycopg2.connect(
+        host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+        user=PG_USER, password=PG_PASSWORD
+    )
     cursor = conn.cursor()
     
-    # Create a separate connection for metrics (reused, not per-call)
-    metrics_conn = psycopg2.connect(**conn_params)
-    
+    # Seed principal table
     seed_principal_table(cursor, args.existing_records)
-    clear_buffer_table(cursor)
+    clear_staging_table(cursor)
     
     update_count = int(args.ingestion_size * args.update_ratio / 100)
     insert_count = args.ingestion_size - update_count
     
     print(f"[GEN] Generating {args.ingestion_size} records...")
     
+    # Get existing combos for updates
     cursor.execute("""
         SELECT account_id, asset_id, reference_date
         FROM custody_position
@@ -431,6 +315,7 @@ def main():
     """, (update_count,))
     existing_combos = set((row[0], row[1], row[2]) for row in cursor.fetchall())
     
+    # Get all existing combos to avoid for inserts
     cursor.execute("SELECT account_id, asset_id, reference_date FROM custody_position")
     all_existing_combos = set((row[0], row[1], row[2]) for row in cursor.fetchall())
     planned_insert_combos = set()
@@ -440,16 +325,18 @@ def main():
     
     source_file = f"sim_{uuid.uuid4().hex[:8]}.parquet"
     batch_uuid = str(uuid.uuid4())
-    update_records = []
     
+    # Generate update records
+    update_records = []
     for i, combo in enumerate(existing_combos):
         account_id, asset_id, reference_date = combo
         quantity = round(random.uniform(10, 10000), 4)
         amount = round(random.uniform(100, 1000000), 2)
         record_hash = uuid.uuid4().hex[:16]
         update_records.append((batch_uuid, source_file, i + 1, record_hash,
-                            account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
+                            account_id, asset_id, reference_date, quantity, amount))
     
+    # Generate insert records (new combos)
     insert_records = []
     attempts = 0
     max_attempts = insert_count * 10
@@ -470,69 +357,53 @@ def main():
         amount = round(random.uniform(100, 1000000), 2)
         record_hash = uuid.uuid4().hex[:16]
         insert_records.append((batch_uuid, source_file, next_row_number, record_hash,
-                            account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
+                            account_id, asset_id, reference_date, quantity, amount))
         next_row_number += 1
     
     all_records = update_records + insert_records
     random.shuffle(all_records)
     
     print(f"[GEN] Prepared {len(update_records)} updates + {len(insert_records)} inserts")
-    print(f"[GEN] Inserting into buffer table...")
+    print(f"[GEN] Inserting into staging table...")
     
     execute_values(
         cursor,
-        """INSERT INTO custody_position_buffer
+        """INSERT INTO custody_position_staging
            (batch_id, source_file, row_number, record_hash, account_id, asset_id,
-            reference_date, quantity, amount, status)
+            reference_date, quantity, amount)
            VALUES %s""",
         all_records,
         page_size=5000
     )
     conn.commit()
     
-    cursor.execute("SELECT COUNT(*) FROM custody_position_buffer WHERE status = 'PENDING'")
-    print(f"[GEN] Buffer has {cursor.fetchone()[0]} PENDING records")
+    cursor.execute("SELECT COUNT(*) FROM custody_position_staging")
+    print(f"[GEN] Staging has {cursor.fetchone()[0]} records")
     
-    # Open CSV file if specified
+    # Open CSV file
     csv_file = None
     csv_writer = None
     if args.output_csv:
         csv_file = open(args.output_csv, 'w', newline='')
         csv_writer = csv.DictWriter(csv_file, fieldnames=[
             'timestamp', 'batch', 'batch_time_ms', 'inserted', 'updated',
-            'total_processed', 'pending_locks', 'dead_custody', 'dead_buffer',
+            'total_processed', 'pending_locks', 'dead_custody', 'dead_staging',
             'cache_hit_ratio', 'long_transactions'
         ])
         csv_writer.writeheader()
         print(f"[CSV] Writing metrics to {args.output_csv}")
     
-    # Start concurrent operations simulator if requested
-    concurrent_sim = None
-    if args.concurrent_ops > 0:
-        concurrent_sim = ConcurrentOperationsSimulator(
-            ops_per_second=args.concurrent_ops,
-            duration_seconds=300
-        )
-        concurrent_sim.start(conn_params)
-        print(f"[CONCURRENT] Simulating {args.concurrent_ops} ops/sec during merge")
-    
-    # Run merge with metrics (pass metrics_conn to be reused)
+    # Run merge
     print(f"\n[MERGE] Starting merge...")
-    total_merged, batch_results, total_time, metrics_history = run_merge_with_metrics(
-        cursor, conn, args.batch_size, args.delay, csv_writer, metrics_conn
+    total_merged, batch_results, total_time, metrics_history = run_merge(
+        cursor, conn, args.batch_size, args.delay, csv_writer
     )
-    
-    # Stop concurrent simulator
-    concurrent_stats = None
-    if concurrent_sim:
-        concurrent_sim.stop()
-        concurrent_stats = concurrent_sim.get_stats()
     
     if csv_file:
         csv_file.close()
     
     # Collect final metrics
-    final_metrics = collect_metrics(metrics_conn)
+    final_metrics = collect_metrics(None)
     
     throughput = total_merged / total_time if total_time > 0 else 0
     
@@ -544,51 +415,35 @@ def main():
     print(f"Existing Records: {args.existing_records:,}")
     print(f"Ingestion Size: {args.ingestion_size:,} ({args.update_ratio}% updates)")
     print(f"Batch Size: {args.batch_size}, Delay: {args.delay}s")
-    if args.concurrent_ops > 0:
-        print(f"Concurrent Ops: {args.concurrent_ops}/sec simulated")
     print()
     print("=== TIMING RESULTS ===")
     print(f"Total Time: {total_time:.2f}s")
     print(f"Throughput: {throughput:.0f} records/second")
     print()
     
-    if concurrent_stats:
-        print("=== CONCURRENT OPERATIONS IMPACT ===")
-        print(f"Total ops attempted: {concurrent_stats['total']}")
-        print(f"Errors: {concurrent_stats['errors']}")
-        print(f"Avg latency: {concurrent_stats['avg_latency_ms']:.1f}ms")
-        print(f"Max latency: {concurrent_stats['max_latency_ms']:.1f}ms")
-        print(f"P95 latency: {concurrent_stats['p95_latency_ms']:.1f}ms")
-        if concurrent_stats['errors'] > 0:
-            error_rate = concurrent_stats['errors'] / (concurrent_stats['total'] + concurrent_stats['errors']) * 100
-            print(f"Error rate: {error_rate:.1f}%")
-        print()
-    
     print("=== ESTIMATED AURORA PERFORMANCE ===")
     for aurora_spec in [AURORA_R6G_LARGE, AURORA_R6G_XLARGE]:
-        est = estimate_aurora_time(throughput, aurora_spec)
+        cpu_ratio = aurora_spec['vcpus'] / LOCAL_SPECS['vcpus']
+        ram_ratio = aurora_spec['ram_gb'] / LOCAL_SPECS['ram_gb']
+        perf_ratio = (cpu_ratio * 0.7 + ram_ratio * 0.3) * 0.8
+        est_throughput = throughput * perf_ratio
+        
         for target in [1000000, 4000000]:
-            est_time_h = (target / est['estimated_throughput'] / 3600) if est['estimated_throughput'] > 0 else 0
+            est_time_h = (target / est_throughput / 3600) if est_throughput > 0 else 0
             print(f"{aurora_spec['name']} ({aurora_spec['vcpus']} vCPU, {aurora_spec['ram_gb']}GB): "
                   f"{target:,} regs → {est_time_h:.2f}h ({est_time_h*60:.0f}min)")
     print()
     
     print("=== FINAL DATABASE STATE ===")
-    print(f"Dead tuples:")
-    print(f"  - custody_position: {final_metrics.get('custody_position_dead', 'N/A')}")
-    print(f"  - custody_position_buffer: {final_metrics.get('custody_position_buffer_dead', 'N/A')}")
+    print(f"Dead tuples (custody_position): {final_metrics.get('custody_position_dead', 'N/A')}")
+    print(f"Dead tuples (staging): {final_metrics.get('custody_position_staging_dead', 'N/A')}")
     print(f"Connections: {final_metrics.get('connections', {})}")
     print(f"Pending locks: {final_metrics.get('pending_locks', 'N/A')}")
     print(f"Cache hit ratio: {final_metrics.get('cache_hit_ratio', 'N/A')}%")
     print("=" * 70)
     
-    if args.output_csv:
-        print(f"\n[CSV] Metrics saved to {args.output_csv}")
-    
-    # Cleanup
     cursor.close()
     conn.close()
-    metrics_conn.close()
 
 
 if __name__ == "__main__":

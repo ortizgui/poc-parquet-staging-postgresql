@@ -18,3 +18,11 @@ data/input/*.parquet
 
 # OS
 .DS_Store
+
+# Images
+
+*.png
+*.csv
+*.html
+# Simulation reports
+reports/
