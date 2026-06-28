@@ -186,10 +186,11 @@ generate_and_upload_parquets() {
     log "  ($RECORDS_PER_FILE registros cada)"
     log "=============================================="
 
-    python3 scripts/generate_parquets.py \
-        --count $NUM_FILES \
+    python3 scripts/generate_unique_test_data.py \
+        --files $NUM_FILES \
         --records-per-file $RECORDS_PER_FILE \
-        --prefix "input/"
+        --prefix "input/" \
+        --upload
 
     local total_records=$((NUM_FILES * RECORDS_PER_FILE))
     success "Gerados $NUM_FILES arquivos ($total_records total registros)"
