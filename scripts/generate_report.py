@@ -6,25 +6,18 @@ Usage:
 """
 
 import argparse
-import base64
+import json
 import os
 import pandas as pd
 from datetime import datetime
-from io import BytesIO
-
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-plt.style.use('dark_background')
 
 
 METRICS = [
     {
-        "key": "Registros Processados",
-        "column": "total_processed",
-        "max": True,
+        "key": "Total de Registros",
+        "calc": lambda df: df['inserted'].sum() + df['updated'].sum(),
         "format": "int",
-        "tooltip": "Total de registros processados da staging para a tabela principal"
+        "tooltip": "Soma de registros inseridos + atualizados"
     },
     {
         "key": "Tempo Total",
@@ -35,19 +28,10 @@ METRICS = [
     },
     {
         "key": "Throughput Médio",
-        "column": "throughput",
-        "calc": lambda df: df['total_processed'].max() / df['timestamp'].max() if df['timestamp'].max() > 0 else 0,
+        "calc": lambda df: (df['inserted'].sum() + df['updated'].sum()) / df['timestamp'].max() if df['timestamp'].max() > 0 else 0,
         "format": "float",
-        "unit": "/s",
+        "unit": " regs/s",
         "tooltip": "Média de registros processados por segundo"
-    },
-    {
-        "key": "Tempo Médio/Batch",
-        "column": "batch_time_ms",
-        "mean": True,
-        "format": "float",
-        "unit": "ms",
-        "tooltip": "Tempo médio de execução de cada batch em milissegundos"
     },
     {
         "key": "Total Inserted",
@@ -64,26 +48,11 @@ METRICS = [
         "tooltip": "Registros existentes atualizados na tabela principal"
     },
     {
-        "key": "Máximo Pending Locks",
-        "column": "pending_locks",
-        "max": True,
-        "format": "int",
-        "tooltip": "Número máximo de locks pendentes durante a execução"
-    },
-    {
         "key": "Total Batches",
         "column": "batch",
         "count": True,
         "format": "int",
         "tooltip": "Quantidade total de batches processados"
-    },
-    {
-        "key": "Último Batch Time",
-        "column": "batch_time_ms",
-        "last": True,
-        "format": "float",
-        "unit": "ms",
-        "tooltip": "Tempo do último batch processado"
     },
 ]
 
@@ -115,38 +84,7 @@ def format_value(value, fmt, unit=""):
     return str(value)
 
 
-def generate_chart(df, x_col, y_col, title, color="#00D9FF"):
-    fig, ax = plt.subplots(figsize=(10, 4), facecolor='#16213e')
-    ax.set_facecolor('#16213e')
-
-    ax.plot(df[x_col], df[y_col], color=color, linewidth=2, marker='o', markersize=4)
-    ax.fill_between(df[x_col], df[y_col], alpha=0.3, color=color)
-
-    ax.set_xlabel(x_col.replace('_', ' ').title(), color='#888', fontsize=10)
-    ax.set_ylabel(y_col.replace('_', ' ').title(), color='#888', fontsize=10)
-    ax.tick_params(colors='#888', labelsize=9)
-    ax.spines['bottom'].set_color('#333')
-    ax.spines['left'].set_color('#333')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.grid(True, alpha=0.2, color='#333')
-
-    ax.set_title(title, color='#fff', fontsize=12, pad=10)
-
-    plt.tight_layout()
-
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight', facecolor='#16213e')
-    plt.close()
-
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode()
-
-
-def generate_throughput_chart(df):
-    if 'batch' not in df.columns or 'batch_time_ms' not in df.columns:
-        return None
-
+def prepare_chart_data(df):
     throughput_per_batch = []
     for i, row in df.iterrows():
         batch_time_s = row['batch_time_ms'] / 1000.0
@@ -156,72 +94,13 @@ def generate_throughput_chart(df):
         else:
             throughput_per_batch.append(0)
 
-    df_plot = df.copy()
-    df_plot['throughput_calc'] = throughput_per_batch
-
-    fig, ax = plt.subplots(figsize=(10, 4), facecolor='#16213e')
-    ax.set_facecolor('#16213e')
-
-    ax.plot(df_plot.index, df_plot['throughput_calc'], color='#00D9FF', linewidth=2, marker='o', markersize=4)
-    ax.fill_between(df_plot.index, df_plot['throughput_calc'], alpha=0.3, color='#00D9FF')
-
-    ax.set_xlabel('Batch', color='#888', fontsize=10)
-    ax.set_ylabel('Throughput (regs/s)', color='#888', fontsize=10)
-    ax.tick_params(colors='#888', labelsize=9)
-    ax.spines['bottom'].set_color('#333')
-    ax.spines['left'].set_color('#333')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.grid(True, alpha=0.2, color='#333')
-
-    ax.set_title('Throughput over Time', color='#fff', fontsize=12, pad=10)
-
-    plt.tight_layout()
-
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight', facecolor='#16213e')
-    plt.close()
-
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode()
-
-
-def generate_inserted_updated_chart(df):
-    if 'batch' not in df.columns:
-        return None
-
-    fig, ax = plt.subplots(figsize=(10, 4), facecolor='#16213e')
-    ax.set_facecolor('#16213e')
-
-    x = range(len(df))
-    width = 0.35
-
-    inserted = df['inserted'].values if 'inserted' in df.columns else [0] * len(df)
-    updated = df['updated'].values if 'updated' in df.columns else [0] * len(df)
-
-    bars1 = ax.bar([i - width/2 for i in x], inserted, width, label='Inserted', color='#00D9FF')
-    bars2 = ax.bar([i + width/2 for i in x], updated, width, label='Updated', color='#FF6B6B')
-
-    ax.set_xlabel('Batch', color='#888', fontsize=10)
-    ax.set_ylabel('Registros', color='#888', fontsize=10)
-    ax.tick_params(colors='#888', labelsize=9)
-    ax.spines['bottom'].set_color('#333')
-    ax.spines['left'].set_color('#333')
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.grid(True, alpha=0.2, color='#333', axis='y')
-    ax.legend(facecolor='#16213e', edgecolor='#333', labelcolor='#fff', fontsize=9)
-
-    ax.set_title('Inserted vs Updated per Batch', color='#fff', fontsize=12, pad=10)
-
-    plt.tight_layout()
-
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight', facecolor='#16213e')
-    plt.close()
-
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode()
+    return {
+        "batchNumbers": [int(x) for x in df['batch'].values],
+        "throughput": throughput_per_batch,
+        "inserted": [int(x) for x in df['inserted'].values],
+        "updated": [int(x) for x in df['updated'].values],
+        "batchTimeMs": [float(x) for x in df['batch_time_ms'].values],
+    }
 
 
 def generate_report(csv_file, output_file=None):
@@ -238,36 +117,24 @@ def generate_report(csv_file, output_file=None):
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    chart_data = prepare_chart_data(df)
+    chart_data_json = json.dumps(chart_data)
+
     metrics_html = ""
     for metric in METRICS:
         value = calculate_metric(df, metric)
         formatted = format_value(value, metric.get("format", "int"), metric.get("unit", ""))
-        tooltip_text = metric.get("tooltip", "")
+        tooltip_text = metric.get("tooltip", "").replace('"', '&quot;')
 
         metrics_html += f"""
             <div class="metric-card">
                 <div class="metric-header">
                     <span class="metric-label">{metric["key"]}</span>
-                    <span class="info-icon" data-tooltip="{tooltip_text}">ℹ️</span>
+                    <span class="info-icon" data-tooltip="{tooltip_text}" onmouseenter="showTooltip(this)" onmouseleave="hideTooltip(this)">ℹ️</span>
                 </div>
                 <div class="metric-value">{formatted}</div>
             </div>
         """
-
-    throughput_chart = generate_throughput_chart(df) if 'batch' in df.columns else None
-    inserted_updated_chart = generate_inserted_updated_chart(df) if 'batch' in df.columns else None
-
-    batch_time_chart = None
-    if 'batch' in df.columns and 'batch_time_ms' in df.columns:
-        batch_time_chart = generate_chart(df, 'batch', 'batch_time_ms', 'Batch Time (ms)', "#FFD93D")
-
-    charts_html = ""
-    if throughput_chart:
-        charts_html += f'<div class="chart-card"><h3>📈 Throughput over Time</h3><img src="data:image/png;base64,{throughput_chart}" alt="Throughput Chart"></div>'
-    if inserted_updated_chart:
-        charts_html += f'<div class="chart-card"><h3>📊 Inserted vs Updated</h3><img src="data:image/png;base64,{inserted_updated_chart}" alt="Inserted vs Updated Chart"></div>'
-    if batch_time_chart:
-        charts_html += f'<div class="chart-card"><h3>⏱️ Batch Time</h3><img src="data:image/png;base64,{batch_time_chart}" alt="Batch Time Chart"></div>'
 
     html_content = f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -276,6 +143,7 @@ def generate_report(csv_file, output_file=None):
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Load Simulation Report - Grafana Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
@@ -290,14 +158,14 @@ def generate_report(csv_file, output_file=None):
         .dashboard {{
             max-width: 1600px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 24px;
         }}
 
         .header {{
             background: linear-gradient(135deg, #16213e 0%, #0f3460 50%, #16213e 100%);
             border-radius: 12px;
-            padding: 30px 40px;
-            margin-bottom: 30px;
+            padding: 32px 40px;
+            margin-bottom: 32px;
             border: 1px solid #0f3460;
             box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
         }}
@@ -319,14 +187,14 @@ def generate_report(csv_file, output_file=None):
         }}
 
         .section {{
-            margin-bottom: 30px;
+            margin-bottom: 36px;
         }}
 
         .section-title {{
             color: #fff;
             font-size: 18px;
             font-weight: 600;
-            margin-bottom: 20px;
+            margin-bottom: 24px;
             padding-bottom: 10px;
             border-bottom: 2px solid #0f3460;
             display: flex;
@@ -336,14 +204,15 @@ def generate_report(csv_file, output_file=None):
 
         .metrics-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 16px;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
         }}
 
         .metric-card {{
             background: #16213e;
-            border-radius: 10px;
-            padding: 20px;
+            border-radius: 12px;
+            padding: 28px;
+            min-height: 120px;
             border: 1px solid #0f3460;
             transition: all 0.3s ease;
             position: relative;
@@ -359,12 +228,12 @@ def generate_report(csv_file, output_file=None):
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
         }}
 
         .metric-label {{
             color: #888;
-            font-size: 12px;
+            font-size: 13px;
             text-transform: uppercase;
             letter-spacing: 1px;
             font-weight: 500;
@@ -373,28 +242,26 @@ def generate_report(csv_file, output_file=None):
         .info-icon {{
             font-size: 14px;
             cursor: pointer;
-            position: relative;
             opacity: 0.6;
             transition: opacity 0.3s ease;
+            position: relative;
         }}
 
         .info-icon:hover {{
             opacity: 1;
         }}
 
-        .info-icon::before {{
-            content: attr(data-tooltip);
+        .tooltip {{
             position: absolute;
-            bottom: 100%;
+            bottom: calc(100% + 10px);
             left: 50%;
             transform: translateX(-50%);
             background: #0f3460;
             color: #fff;
-            padding: 8px 12px;
-            border-radius: 6px;
-            font-size: 11px;
-            white-space: nowrap;
-            max-width: 250px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 12px;
+            max-width: 280px;
             white-space: normal;
             text-transform: none;
             letter-spacing: 0;
@@ -403,31 +270,41 @@ def generate_report(csv_file, output_file=None):
             transition: all 0.3s ease;
             z-index: 100;
             border: 1px solid #00D9FF;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+            pointer-events: none;
         }}
 
-        .info-icon:hover::before {{
+        .tooltip::after {{
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 6px solid transparent;
+            border-top-color: #0f3460;
+        }}
+
+        .tooltip.visible {{
             opacity: 1;
             visibility: visible;
-            bottom: calc(100% + 8px);
         }}
 
         .metric-value {{
-            font-size: 26px;
+            font-size: 36px;
             font-weight: 700;
             color: #00D9FF;
         }}
 
         .charts-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 24px;
         }}
 
         .chart-card {{
             background: #16213e;
-            border-radius: 10px;
-            padding: 20px;
+            border-radius: 12px;
+            padding: 24px;
             border: 1px solid #0f3460;
             transition: all 0.3s ease;
         }}
@@ -439,18 +316,17 @@ def generate_report(csv_file, output_file=None):
 
         .chart-card h3 {{
             color: #fff;
-            font-size: 14px;
+            font-size: 15px;
             font-weight: 600;
-            margin-bottom: 15px;
+            margin-bottom: 16px;
             display: flex;
             align-items: center;
             gap: 8px;
         }}
 
-        .chart-card img {{
-            width: 100%;
-            height: auto;
-            border-radius: 6px;
+        .chart-container {{
+            position: relative;
+            height: 250px;
         }}
 
         .footer {{
@@ -460,24 +336,27 @@ def generate_report(csv_file, output_file=None):
             font-size: 12px;
         }}
 
-        @media (max-width: 768px) {{
+        @media (max-width: 1024px) {{
             .metrics-grid {{
                 grid-template-columns: repeat(2, 1fr);
+            }}
+        }}
+
+        @media (max-width: 768px) {{
+            .metrics-grid {{
+                grid-template-columns: 1fr;
             }}
             .charts-grid {{
                 grid-template-columns: 1fr;
             }}
             .header {{
-                padding: 20px;
+                padding: 24px;
             }}
             .header h1 {{
                 font-size: 22px;
             }}
-        }}
-
-        @media (max-width: 480px) {{
-            .metrics-grid {{
-                grid-template-columns: 1fr;
+            .metric-value {{
+                font-size: 30px;
             }}
         }}
     </style>
@@ -499,7 +378,24 @@ def generate_report(csv_file, output_file=None):
         <div class="section">
             <div class="section-title">📉 Gráficos</div>
             <div class="charts-grid">
-                {charts_html}
+                <div class="chart-card">
+                    <h3>📈 Throughput over Time</h3>
+                    <div class="chart-container">
+                        <canvas id="chart-throughput"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <h3>📊 Inserted vs Updated</h3>
+                    <div class="chart-container">
+                        <canvas id="chart-inserted-updated"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <h3>⏱️ Batch Time</h3>
+                    <div class="chart-container">
+                        <canvas id="chart-batch-time"></canvas>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -507,6 +403,117 @@ def generate_report(csv_file, output_file=None):
             Load Simulation Report | POC Parquet Staging PostgreSQL
         </div>
     </div>
+
+    <script>
+        const chartData = {chart_data_json};
+
+        function showTooltip(el) {{
+            const tooltip = el.querySelector('.tooltip') || createTooltip(el);
+            tooltip.classList.add('visible');
+        }}
+
+        function hideTooltip(el) {{
+            const tooltip = el.querySelector('.tooltip');
+            if (tooltip) tooltip.classList.remove('visible');
+        }}
+
+        function createTooltip(el) {{
+            const tooltip = document.createElement('div');
+            tooltip.className = 'tooltip';
+            tooltip.textContent = el.getAttribute('data-tooltip');
+            el.appendChild(tooltip);
+            return tooltip;
+        }}
+
+        const chartOptions = {{
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {{
+                legend: {{ display: false }},
+                tooltip: {{
+                    mode: 'index',
+                    intersect: false,
+                    backgroundColor: '#0f3460',
+                    titleColor: '#fff',
+                    bodyColor: '#fff',
+                    borderColor: '#00D9FF',
+                    borderWidth: 1,
+                    padding: 12,
+                    cornerRadius: 8
+                }}
+            }}
+        }};
+
+        new Chart(document.getElementById('chart-throughput'), {{
+            type: 'line',
+            data: {{
+                labels: chartData.batchNumbers,
+                datasets: [{{
+                    label: 'Throughput (regs/s)',
+                    data: chartData.throughput,
+                    borderColor: '#00D9FF',
+                    backgroundColor: 'rgba(0, 217, 255, 0.1)',
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 4,
+                    pointHoverRadius: 6
+                }}]
+            }},
+            options: chartOptions
+        }});
+
+        new Chart(document.getElementById('chart-inserted-updated'), {{
+            type: 'bar',
+            data: {{
+                labels: chartData.batchNumbers,
+                datasets: [
+                    {{
+                        label: 'Inserted',
+                        data: chartData.inserted,
+                        backgroundColor: 'rgba(0, 217, 255, 0.8)',
+                        borderRadius: 4
+                    }},
+                    {{
+                        label: 'Updated',
+                        data: chartData.updated,
+                        backgroundColor: 'rgba(255, 107, 107, 0.8)',
+                        borderRadius: 4
+                    }}
+                ]
+            }},
+            options: {{
+                ...chartOptions,
+                scales: {{
+                    x: {{
+                        grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                        ticks: {{ color: '#888' }}
+                    }},
+                    y: {{
+                        grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                        ticks: {{ color: '#888' }}
+                    }}
+                }}
+            }}
+        }});
+
+        new Chart(document.getElementById('chart-batch-time'), {{
+            type: 'line',
+            data: {{
+                labels: chartData.batchNumbers,
+                datasets: [{{
+                    label: 'Batch Time (ms)',
+                    data: chartData.batchTimeMs,
+                    borderColor: '#FFD93D',
+                    backgroundColor: 'rgba(255, 217, 61, 0.1)',
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 4,
+                    pointHoverRadius: 6
+                }}]
+            }},
+            options: chartOptions
+        }});
+    </script>
 </body>
 </html>"""
 
