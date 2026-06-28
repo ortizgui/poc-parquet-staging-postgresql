@@ -39,31 +39,65 @@ def generate_existing_combos(cursor, count):
     return cursor.fetchall()
 
 
-def generate_records(combos, count, is_update, days_back=30):
+def generate_unique_records_for_seed(count, days_back=30):
+    """Generate records with unique (account_id, asset_id, reference_date) combos."""
+    records = []
+    base_date = datetime.now().date()
+    dates = [base_date - timedelta(days=i) for i in range(days_back + 1)]
+    
+    seen = set()
+    attempts = 0
+    max_attempts = count * 2
+    
+    while len(records) < count and attempts < max_attempts:
+        attempts += 1
+        account_id = random.choice(ACCOUNTS)
+        asset_id = random.choice(ASSETS)
+        reference_date = random.choice(dates)
+        
+        key = (account_id, asset_id, reference_date)
+        if key in seen:
+            continue
+            
+        seen.add(key)
+        quantity = round(random.uniform(10, 10000), 4)
+        amount = round(random.uniform(100, 1000000), 2)
+        records.append((account_id, asset_id, reference_date, quantity, amount))
+    
+    if len(records) < count:
+        print(f"[WARN] Only generated {len(records)} unique records (requested {count})")
+    
+    return records
+
+
+def generate_insert_records(count, days_back=30):
+    """Generate new records for insert that won't conflict with existing data."""
     records = []
     base_date = datetime.now().date()
     source_file = f"sim_{uuid.uuid4().hex[:8]}.parquet"
-
-    for i, combo in enumerate(combos[:count] if is_update else []):
-        account_id, asset_id, reference_date = combo
-        quantity = round(random.uniform(10, 10000), 4)
-        amount = round(random.uniform(100, 1000000), 2)
-        row_number = i + 1
-        record_hash = uuid.uuid4().hex[:16]
-        records.append((uuid.UUID(source_file), source_file, row_number, record_hash,
-                        account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
-
-    for i in range(count - len(records)):
+    
+    seen = set()
+    attempts = 0
+    max_attempts = count * 2
+    
+    while len(records) < count and attempts < max_attempts:
+        attempts += 1
         account_id = random.choice(ACCOUNTS)
         asset_id = random.choice(ASSETS)
         reference_date = base_date - timedelta(days=random.randint(0, days_back))
+        
+        key = (account_id, asset_id, reference_date)
+        if key in seen:
+            continue
+            
+        seen.add(key)
         quantity = round(random.uniform(10, 10000), 4)
         amount = round(random.uniform(100, 1000000), 2)
-        row_number = len(records) + i + 1
+        row_number = len(records) + 1
         record_hash = uuid.uuid4().hex[:16]
         records.append((uuid.UUID(source_file), source_file, row_number, record_hash,
                         account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
-
+    
     return records
 
 
@@ -77,15 +111,7 @@ def seed_principal_table(cursor, count):
     print(f"[SEED] Seeding principal table with {count} records...")
     cursor.execute("TRUNCATE TABLE custody_position CASCADE")
 
-    base_date = datetime.now().date()
-    records = []
-    for _ in range(count):
-        account_id = random.choice(ACCOUNTS)
-        asset_id = random.choice(ASSETS)
-        reference_date = base_date - timedelta(days=random.randint(0, 30))
-        quantity = round(random.uniform(10, 10000), 4)
-        amount = round(random.uniform(100, 1000000), 2)
-        records.append((account_id, asset_id, reference_date, quantity, amount))
+    records = generate_unique_records_for_seed(count)
 
     execute_values(
         cursor,
@@ -219,10 +245,22 @@ def main():
     update_count = int(args.ingestion_size * args.update_ratio / 100)
     insert_count = args.ingestion_size - update_count
 
+    # Get existing combos for updates
     existing_combos = generate_existing_combos(cursor, update_count)
+    
+    # Generate update records (using existing combos)
+    source_file = f"sim_{uuid.uuid4().hex[:8]}.parquet"
+    update_records = []
+    for i, combo in enumerate(existing_combos):
+        account_id, asset_id, reference_date = combo
+        quantity = round(random.uniform(10, 10000), 4)
+        amount = round(random.uniform(100, 1000000), 2)
+        record_hash = uuid.uuid4().hex[:16]
+        update_records.append((uuid.UUID(source_file), source_file, i + 1, record_hash,
+                              account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
 
-    update_records = generate_records(existing_combos, update_count, is_update=True)
-    insert_records = generate_records(existing_combos, insert_count, is_update=False)
+    # Generate insert records (new combos)
+    insert_records = generate_insert_records(insert_count)
 
     all_records = update_records + insert_records
     random.shuffle(all_records)
