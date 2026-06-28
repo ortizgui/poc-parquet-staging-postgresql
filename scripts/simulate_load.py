@@ -1,4 +1,4 @@
-"""Load simulation tool for the POC.
+"""Load simulation tool for the POC with database metrics collection.
 
 Usage:
     python3 scripts/simulate_load.py --existing-records 100000 --ingestion-size 10000 --update-ratio 60
@@ -84,22 +84,115 @@ def clear_buffer_table(cursor):
     print("[SETUP] Buffer table cleared")
 
 
+def collect_db_metrics(cursor):
+    """Collect database metrics before merge starts."""
+    metrics = {}
+    
+    # Database size
+    cursor.execute("""
+        SELECT pg_database_size(%s) / 1024 / 1024 as size_mb
+    """, (PG_DB,))
+    metrics['db_size_mb'] = cursor.fetchone()[0]
+    
+    # Table sizes
+    cursor.execute("""
+        SELECT 
+            c.relname,
+            pg_stat_get_live_tup(c.oid) as live_tuples,
+            pg_stat_get_dead_tup(c.oid) as dead_tuples
+        FROM pg_class c
+        WHERE c.relname IN ('custody_position', 'custody_position_buffer')
+        ORDER BY c.relname
+    """)
+    for row in cursor.fetchall():
+        metrics[f'{row[0]}_live'] = row[1]
+        metrics[f'{row[0]}_dead'] = row[2]
+    
+    # Active connections
+    cursor.execute("""
+        SELECT state, COUNT(*) 
+        FROM pg_stat_activity 
+        WHERE datname = %s
+        GROUP BY state
+    """, (PG_DB,))
+    metrics['connections'] = dict(cursor.fetchall())
+    
+    # Lock info
+    cursor.execute("""
+        SELECT COUNT(*) 
+        FROM pg_locks 
+        WHERE granted = false
+    """)
+    metrics['pending_locks'] = cursor.fetchone()[0]
+    
+    return metrics
+
+
+def collect_batch_metrics(cursor, batch_num):
+    """Collect metrics during merge."""
+    metrics = {'batch': batch_num, 'timestamp': datetime.now().strftime('%H:%M:%S')}
+    
+    # Get memory stats from pg_stat_activity (useful for PostgreSQL 13+)
+    try:
+        cursor.execute("""
+            SELECT COUNT(*) FROM pg_stat_activity 
+            WHERE state = 'active' AND query != '<IDLE>'
+        """)
+        metrics['active_queries'] = cursor.fetchone()[0]
+    except:
+        metrics['active_queries'] = 'N/A'
+    
+    # Dead tuples in tables being merged
+    cursor.execute("""
+        SELECT 
+            c.relname,
+            pg_stat_get_dead_tup(c.oid) as dead_tuples
+        FROM pg_class c
+        WHERE c.relname IN ('custody_position', 'custody_position_buffer')
+    """)
+    for row in cursor.fetchall():
+        metrics[f'{row[0]}_dead'] = row[1]
+    
+    # Long running queries
+    cursor.execute("""
+        SELECT MAX(EXTRACT(EPOCH FROM (NOW() - state_change))) * 1000 as oldest_query_ms
+        FROM pg_stat_activity 
+        WHERE state = 'active' AND query != '<IDLE>'
+    """)
+    metrics['oldest_query_ms'] = cursor.fetchone()[0]
+    
+    return metrics
+
+
 def run_merge(cursor, conn, batch_size, delay):
     cursor.execute("SELECT pg_advisory_lock(%s)", (MERGE_LOCK_ID,))
+    print("[MERGE] Advisory lock adquirido (lock_id=42)")
 
     cursor.execute("SELECT COUNT(*) FROM custody_position_buffer WHERE status = 'PENDING'")
     pending_before = cursor.fetchone()[0]
 
     if pending_before == 0:
         cursor.execute("SELECT pg_advisory_unlock(%s)", (MERGE_LOCK_ID,))
-        return 0, [], 0
+        return 0, [], 0, {}
 
     total_merged = 0
     batch_results = []
+    batch_metrics = []
     start_time = time.time()
+    
+    # Collect initial metrics
+    initial_metrics = collect_db_metrics(cursor)
+    print(f"[METRICS] Initial - DB size: {initial_metrics.get('db_size_mb', 'N/A')}MB, "
+          f"Connections: {initial_metrics.get('connections', {})}, "
+          f"Pending locks: {initial_metrics.get('pending_locks', 'N/A')}")
 
     while True:
         batch_start = time.time()
+        batch_num = total_merged // batch_size + 1
+        
+        # Collect pre-batch metrics
+        pre_batch_metrics = collect_batch_metrics(cursor, batch_num)
+        
         cursor.execute("""
             SELECT id
             FROM custody_position_buffer
@@ -153,18 +246,44 @@ def run_merge(cursor, conn, batch_size, delay):
         conn.commit()
         total_merged += len(batch_ids)
         batch_time = time.time() - batch_start
-        batch_results.append((len(batch_ids), inserted, updated, batch_time))
+        
+        # Collect post-batch metrics
+        post_batch_metrics = collect_batch_metrics(cursor, batch_num)
+        batch_metrics.append({
+            'batch': batch_num,
+            'time': batch_time,
+            'inserted': inserted,
+            'updated': updated,
+            'dead_custody': post_batch_metrics.get('custody_position_dead', 0),
+            'dead_buffer': post_batch_metrics.get('custody_position_buffer_dead', 0)
+        })
+        
+        pct = (total_merged / pending_before) * 100
+        total_batches = (pending_before + batch_size - 1) // batch_size
+        print(f"  [MERGE] batch {batch_num}/{total_batches}: "
+              f"+{inserted} ins, ~{updated} upd ({pct:.0f}%) - {batch_time:.3f}s "
+              f"| dead_tuples: cp={post_batch_metrics.get('custody_position_dead', 0)}, "
+              f"buf={post_batch_metrics.get('custody_position_buffer_dead', 0)}")
 
         if delay > 0:
             time.sleep(delay)
 
     cursor.execute("SELECT pg_advisory_unlock(%s)", (MERGE_LOCK_ID,))
+    print("[MERGE] Advisory lock liberado")
 
     cursor.execute("DELETE FROM custody_position_buffer WHERE status = 'MERGED'")
     cursor.connection.commit()
 
     total_time = time.time() - start_time
-    return total_merged, batch_results, total_time
+    
+    # Collect final metrics
+    final_metrics = collect_db_metrics(cursor)
+    
+    return total_merged, batch_results, total_time, {
+        'initial': initial_metrics,
+        'final': final_metrics,
+        'batches': batch_metrics
+    }
 
 
 def main():
@@ -237,7 +356,7 @@ def main():
     insert_records = []
     attempts = 0
     max_attempts = insert_count * 10
-    next_row_number = len(update_records) + 1  # Continue row numbering from updates
+    next_row_number = len(update_records) + 1
     
     while len(insert_records) < insert_count and attempts < max_attempts:
         attempts += 1
@@ -256,7 +375,7 @@ def main():
         amount = round(random.uniform(100, 1000000), 2)
         record_hash = uuid.uuid4().hex[:16]
         insert_records.append((batch_uuid, source_file, next_row_number, record_hash,
-                             account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
+                            account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
         next_row_number += 1
 
     if len(insert_records) < insert_count:
@@ -284,8 +403,8 @@ def main():
     buffer_count = cursor.fetchone()[0]
     print(f"[GEN] Buffer table has {buffer_count} PENDING records")
 
-    print(f"[MERGE] Starting merge with batch_size={args.batch_size}, delay={args.delay}s...")
-    total_merged, batch_results, total_time = run_merge(cursor, conn, args.batch_size, args.delay)
+    print(f"\n[MERGE] Starting merge with batch_size={args.batch_size}, delay={args.delay}s...")
+    total_merged, batch_results, total_time, metrics = run_merge(cursor, conn, args.batch_size, args.delay)
 
     throughput = total_merged / total_time if total_time > 0 else 0
 
@@ -293,27 +412,40 @@ def main():
     update_pct = args.update_ratio
     insert_pct = 100 - args.update_ratio
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("=== LOAD SIMULATION REPORT ===")
     print(f"Date: {timestamp}")
-    print(f"Existing Records: {args.existing_records}")
-    print(f"Ingestion Size: {args.ingestion_size} ({update_pct}% updates, {insert_pct}% inserts)")
+    print(f"Existing Records: {args.existing_records:,}")
+    print(f"Ingestion Size: {args.ingestion_size:,} ({update_pct}% updates, {insert_pct}% inserts)")
     print(f"Batch Size: {args.batch_size}")
     print(f"Delay: {args.delay}s")
     print()
     print("=== RESULTS ===")
     print(f"Total Time: {total_time:.3f}s")
     print(f"Throughput: {throughput:.1f} records/second")
-    print(f"Batches: {len(batch_results)}")
+    print(f"Batches: {len(metrics['batches'])}")
     print("Per-batch breakdown:")
-    for i, (count, ins, upd, bt) in enumerate(batch_results, 1):
-        print(f"  - Batch {i}: {ins} ins, {upd} upd - {bt:.3f}s")
+    for b in metrics['batches']:
+        print(f"  - Batch {b['batch']}: {b['inserted']} ins, {b['updated']} upd - {b['time']:.3f}s (dead: cp={b['dead_custody']}, buf={b['dead_buffer']})")
+    print()
+    print("=== DATABASE METRICS ===")
+    initial = metrics['initial']
+    final = metrics['final']
+    print(f"DB Size: {initial.get('db_size_mb', 'N/A')}MB -> {final.get('db_size_mb', 'N/A')}MB")
+    print(f"Connections: {initial.get('connections', {})}")
+    print(f"Pending Locks: {initial.get('pending_locks', 'N/A')} -> {final.get('pending_locks', 'N/A')}")
+    print(f"Dead tuples (initial):")
+    print(f"  - custody_position: {initial.get('custody_position_dead', 'N/A')}")
+    print(f"  - custody_position_buffer: {initial.get('custody_position_buffer_dead', 'N/A')}")
+    print(f"Dead tuples (final):")
+    print(f"  - custody_position: {final.get('custody_position_dead', 'N/A')}")
+    print(f"  - custody_position_buffer: {final.get('custody_position_buffer_dead', 'N/A')}")
     print()
     print("=== ESTIMATED PRODUCTION ===")
-    for target in [4000000]:
+    for target in [1000000, 2000000, 4000000]:
         est_time = (target / throughput / 3600) if throughput > 0 else 0
-        print(f"For {target:,} records: {est_time:.1f}h")
-    print("=" * 60)
+        print(f"For {target:,} records: {est_time:.2f}h ({est_time*60:.1f}min)")
+    print("=" * 70)
 
     cursor.close()
     conn.close()
