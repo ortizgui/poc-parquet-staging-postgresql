@@ -380,6 +380,101 @@ def generate_report(csv_file, output_file=None):
             height: 250px;
         }}
 
+        .comparison-table-container {{
+            overflow-x: auto;
+        }}
+
+        .comparison-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }}
+
+        .comparison-table th,
+        .comparison-table td {{
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid #1a3a4a;
+        }}
+
+        .comparison-table th {{
+            background: linear-gradient(135deg, #0a4a5c 0%, #0d5d75 100%);
+            color: #00d9ff;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        }}
+
+        .comparison-table tbody tr {{
+            background: #0f2337;
+            transition: background 0.2s ease;
+        }}
+
+        .comparison-table tbody tr:hover {{
+            background: #1a3a4a;
+        }}
+
+        .comparison-table tbody tr:nth-child(even) {{
+            background: #0c1f30;
+        }}
+
+        .comparison-table tbody tr:nth-child(even):hover {{
+            background: #1a3a4a;
+        }}
+
+        .comparison-table td {{
+            color: #e0e0e0;
+        }}
+
+        .comparison-table td:first-child {{
+            color: #00d9ff;
+            font-weight: 500;
+        }}
+
+        .perf-badge {{
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            background: rgba(0, 217, 255, 0.15);
+            color: #00d9ff;
+        }}
+
+        .perf-badge.baseline {{
+            background: rgba(0, 255, 136, 0.15);
+            color: #00ff88;
+        }}
+
+        .perf-badge.highlight {{
+            background: rgba(0, 255, 136, 0.2);
+            color: #00ff88;
+            font-weight: 700;
+        }}
+
+        .best-value {{
+            color: #00ff88;
+            font-size: 11px;
+            margin-left: 6px;
+        }}
+
+        .comparison-note {{
+            margin-top: 16px;
+            padding: 12px 16px;
+            background: rgba(255, 193, 7, 0.1);
+            border-left: 3px solid #ffc107;
+            border-radius: 0 4px 4px 0;
+            color: #ffc107;
+            font-size: 13px;
+        }}
+
+        .not-available {{
+            color: #ff6b6b;
+            font-weight: 600;
+        }}
+
         .footer {{
             text-align: center;
             color: #555;
@@ -469,6 +564,90 @@ def generate_report(csv_file, output_file=None):
                         <canvas id="chart-batch-time"></canvas>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">🖥️ Comparação Estimada - AWS Aurora com Graviton</div>
+            <p class="comparison-note">📊 <strong>Melhorias do Graviton4 vs Graviton2:</strong> até 40% melhor performance • DDR4 → DDR5-5600+ (75% mais banda) • 10 Gbps → 12.5 Gbps rede • EBS até 10,000 Mbps</p>
+            <div class="comparison-table-container">
+                <table class="comparison-table">
+                    <thead>
+                        <tr>
+                            <th>Instância</th>
+                            <th>vCPU</th>
+                            <th>Memória</th>
+                            <th>Rede</th>
+                            <th>EBS</th>
+                            <th>Performance (vs r6g.xlarge)</th>
+                            <th>Tempo Est. (200k registros)</th>
+                            <th>Custo/hr (USD)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>db.r6g.large</strong></td>
+                            <td>2</td>
+                            <td>16 GiB DDR4</td>
+                            <td>up to 10 Gbps</td>
+                            <td>up to 4,750 Mbps</td>
+                            <td><span class="perf-badge">0.5x</span></td>
+                            <td>124.8s</td>
+                            <td>~$0.15</td>
+                        </tr>
+                        <tr>
+                            <td><strong>db.r6g.xlarge</strong></td>
+                            <td>4</td>
+                            <td>32 GiB DDR4</td>
+                            <td>up to 10 Gbps</td>
+                            <td>up to 4,750 Mbps</td>
+                            <td><span class="perf-badge baseline">1.0x (baseline)</span></td>
+                            <td>62.4s</td>
+                            <td>~$0.45</td>
+                        </tr>
+                        <tr>
+                            <td><strong>db.r7g.large</strong></td>
+                            <td>2</td>
+                            <td>16 GiB DDR5</td>
+                            <td>up to 12.5 Gbps</td>
+                            <td>up to 10,000 Mbps</td>
+                            <td><span class="perf-badge">0.65x</span></td>
+                            <td>96.0s</td>
+                            <td>~$0.13</td>
+                        </tr>
+                        <tr>
+                            <td><strong>db.r7g.xlarge</strong></td>
+                            <td>4</td>
+                            <td>32 GiB DDR5</td>
+                            <td>up to 12.5 Gbps</td>
+                            <td>up to 10,000 Mbps</td>
+                            <td><span class="perf-badge">1.35x</span></td>
+                            <td>46.2s</td>
+                            <td>~$0.40</td>
+                        </tr>
+                        <tr>
+                            <td><strong>db.r8g.large</strong></td>
+                            <td>2</td>
+                            <td>16 GiB DDR5-5600+</td>
+                            <td>up to 12.5 Gbps</td>
+                            <td>up to 10,000 Mbps</td>
+                            <td><span class="perf-badge">0.75x</span></td>
+                            <td>83.2s</td>
+                            <td>~$0.12</td>
+                        </tr>
+                        <tr>
+                            <td><strong>db.r8g.xlarge</strong></td>
+                            <td>4</td>
+                            <td>32 GiB DDR5-5600+</td>
+                            <td>up to 12.5 Gbps</td>
+                            <td>up to 10,000 Mbps</td>
+                            <td><span class="perf-badge highlight">1.4x</span></td>
+                            <td>44.6s</td>
+                            <td>~$0.478</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p class="comparison-note">📝 <strong>Nota:</strong> db.r9g (Graviton 5) <span class="not-available">NÃO está disponível</span> para Aurora PostgreSQL ainda.</p>
             </div>
         </div>
 
