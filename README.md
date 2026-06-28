@@ -278,17 +278,20 @@ Ferramenta para simular carga de produção e validar configurações de merge a
 ### Uso Básico
 
 ```bash
-# 1. Preencher tabela principal com dados existentes
-python3 scripts/seed_database.py --records 100000
-
-# 2. Executar simulação de carga
+# Simular carga (já faz seed automático da tabela principal)
 python3 scripts/simulate_load.py \
     --existing-records 100000 \
     --ingestion-size 10000 \
     --update-ratio 60 \
     --batch-size 2000 \
     --delay 0.5
+
+# Ou seedar manualmente a tabela principal primeiro
+python3 scripts/seed_database.py --records 100000
 ```
+
+**Nota:** `simulate_load.py` sempre trunca e re-seda a tabela principal antes da simulação,
+garantindo estado limpo. `seed_database.py` também sempre trunca antes de inserir.
 
 ### Parâmetros
 
