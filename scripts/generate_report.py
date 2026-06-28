@@ -54,6 +54,34 @@ METRICS = [
         "format": "int",
         "tooltip": "Quantidade total de batches processados"
     },
+    {
+        "key": "Dead Tuples (Principal)",
+        "column": "dead_custody",
+        "sum": True,
+        "format": "int",
+        "tooltip": "Total de dead tuples (lixo) acumulados na tabela principal durante o merge"
+    },
+    {
+        "key": "Dead Tuples (Staging)",
+        "column": "dead_staging",
+        "sum": True,
+        "format": "int",
+        "tooltip": "Total de dead tuples (lixo) acumulados na tabela staging durante o merge"
+    },
+    {
+        "key": "Max Pending Locks",
+        "column": "pending_locks",
+        "max": True,
+        "format": "int",
+        "tooltip": "Número máximo de locks pendentes durante a execução do merge"
+    },
+    {
+        "key": "Taxa de Erro",
+        "calc": lambda df: (df['dead_custody'].sum() / (df['inserted'].sum() + df['updated'].sum()) * 100) if (df['inserted'].sum() + df['updated'].sum()) > 0 else 0,
+        "format": "float",
+        "unit": "%",
+        "tooltip": "Percentual de dead tuples em relação ao total de registros processados"
+    },
 ]
 
 
@@ -136,6 +164,24 @@ def generate_report(csv_file, output_file=None):
             </div>
         """
 
+    error_metrics = [m for m in METRICS if m.get("key") in [
+        "Dead Tuples (Principal)", "Dead Tuples (Staging)", "Max Pending Locks", "Taxa de Erro"
+    ]]
+    error_metrics_html = ""
+    for metric in error_metrics:
+        value = calculate_metric(df, metric)
+        formatted = format_value(value, metric.get("format", "int"), metric.get("unit", ""))
+        tooltip_text = metric.get("tooltip", "")
+        error_metrics_html += f"""
+            <div class="metric-card">
+                <div class="metric-header">
+                    <span class="metric-label">{metric["key"]}</span>
+                    <span class="info-icon" data-tooltip="{tooltip_text}" onmouseenter="showTooltip(this)" onmouseleave="hideTooltip(this)">ℹ️</span>
+                </div>
+                <div class="metric-value">{formatted}</div>
+            </div>
+        """
+
     html_content = f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -200,6 +246,11 @@ def generate_report(csv_file, output_file=None):
             display: flex;
             align-items: center;
             gap: 10px;
+        }}
+
+        .section-title.warning {{
+            color: #FF6B6B;
+            border-bottom-color: #FF6B6B;
         }}
 
         .metrics-grid {{
@@ -372,6 +423,13 @@ def generate_report(csv_file, output_file=None):
             <div class="section-title">📈 Métricas Gerais</div>
             <div class="metrics-grid">
                 {metrics_html}
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title warning">⚠️ Status de Erros</div>
+            <div class="metrics-grid">
+                {error_metrics_html}
             </div>
         </div>
 
