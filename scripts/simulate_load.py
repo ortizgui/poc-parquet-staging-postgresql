@@ -75,6 +75,7 @@ def generate_insert_records(count, days_back=30):
     records = []
     base_date = datetime.now().date()
     source_file = f"sim_{uuid.uuid4().hex[:8]}.parquet"
+    batch_uuid = uuid.uuid4()
     
     seen = set()
     attempts = 0
@@ -95,7 +96,7 @@ def generate_insert_records(count, days_back=30):
         amount = round(random.uniform(100, 1000000), 2)
         row_number = len(records) + 1
         record_hash = uuid.uuid4().hex[:16]
-        records.append((uuid.UUID(source_file), source_file, row_number, record_hash,
+        records.append((batch_uuid, source_file, row_number, record_hash,
                         account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
     
     return records
