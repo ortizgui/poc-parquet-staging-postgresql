@@ -237,6 +237,7 @@ def main():
     insert_records = []
     attempts = 0
     max_attempts = insert_count * 10
+    next_row_number = len(update_records) + 1  # Continue row numbering from updates
     
     while len(insert_records) < insert_count and attempts < max_attempts:
         attempts += 1
@@ -253,10 +254,10 @@ def main():
         planned_insert_combos.add(key)
         quantity = round(random.uniform(10, 10000), 4)
         amount = round(random.uniform(100, 1000000), 2)
-        row_number = len(insert_records) + 1
         record_hash = uuid.uuid4().hex[:16]
-        insert_records.append((batch_uuid, source_file, row_number, record_hash,
+        insert_records.append((batch_uuid, source_file, next_row_number, record_hash,
                              account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
+        next_row_number += 1
 
     if len(insert_records) < insert_count:
         print(f"[WARN] Only generated {len(insert_records)} unique insert records (needed {insert_count})")
