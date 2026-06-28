@@ -205,20 +205,28 @@ def estimate_aurora_time(local_throughput, aurora_specs, local_specs=LOCAL_SPECS
     }
 
 
-def collect_metrics(cursor):
-    """Collect comprehensive database metrics."""
+def collect_metrics():
+    """Collect comprehensive database metrics using separate connection."""
     metrics = {}
     
-    try:
-        # Database size
-        cursor.execute("SELECT pg_database_size(%s) / 1024 / 1024", (PG_DB,))
-        metrics['db_size_mb'] = cursor.fetchone()[0]
-    except:
-        metrics['db_size_mb'] = None
+    conn_params = {
+        'host': PG_HOST,
+        'port': PG_PORT,
+        'dbname': PG_DB,
+        'user': PG_USER,
+        'password': PG_PASSWORD
+    }
     
     try:
+        conn = psycopg2.connect(**conn_params)
+        cur = conn.cursor()
+        
+        # Database size
+        cur.execute("SELECT pg_database_size(%s) / 1024 / 1024", (PG_DB,))
+        metrics['db_size_mb'] = cur.fetchone()[0]
+        
         # Table stats
-        cursor.execute("""
+        cur.execute("""
             SELECT 
                 c.relname,
                 pg_stat_get_live_tup(c.oid) as live_tuples,
@@ -228,51 +236,35 @@ def collect_metrics(cursor):
             WHERE c.relname IN ('custody_position', 'custody_position_buffer')
             ORDER BY c.relname
         """)
-        for row in cursor.fetchall():
+        for row in cur.fetchall():
             metrics[f'{row[0]}_live'] = row[1]
             metrics[f'{row[0]}_dead'] = row[2]
             metrics[f'{row[0]}_size'] = row[3]
-    except Exception as e:
-        pass
-    
-    try:
+        
         # Connections
-        cursor.execute("""
+        cur.execute("""
             SELECT state, COUNT(*) 
             FROM pg_stat_activity 
             WHERE datname = %s
             GROUP BY state
         """, (PG_DB,))
-        metrics['connections'] = dict(cursor.fetchall())
-    except:
-        metrics['connections'] = {}
-    
-    try:
+        metrics['connections'] = dict(cur.fetchall())
+        
         # Lock waiters
-        cursor.execute("""
-            SELECT COUNT(*) 
-            FROM pg_locks 
-            WHERE granted = false
-        """)
-        metrics['pending_locks'] = cursor.fetchone()[0]
-    except:
-        metrics['pending_locks'] = 0
-    
-    try:
+        cur.execute("SELECT COUNT(*) FROM pg_locks WHERE granted = false")
+        metrics['pending_locks'] = cur.fetchone()[0]
+        
         # Long running transactions
-        cursor.execute("""
+        cur.execute("""
             SELECT COUNT(*) 
             FROM pg_stat_activity 
             WHERE state = 'idle in transaction' 
             AND query_start < NOW() - INTERVAL '5 seconds'
         """)
-        metrics['long_transactions'] = cursor.fetchone()[0]
-    except:
-        metrics['long_transactions'] = 0
-    
-    try:
+        metrics['long_transactions'] = cur.fetchone()[0]
+        
         # Buffer cache hit ratio
-        cursor.execute("""
+        cur.execute("""
             SELECT 
                 CASE WHEN blks_hit + blks_read = 0 THEN 0
                 ELSE ROUND(100.0 * blks_hit / (blks_hit + blks_read), 2)
@@ -280,9 +272,13 @@ def collect_metrics(cursor):
             FROM pg_stat_database 
             WHERE datname = %s
         """, (PG_DB,))
-        metrics['cache_hit_ratio'] = cursor.fetchone()[0]
-    except:
-        metrics['cache_hit_ratio'] = None
+        metrics['cache_hit_ratio'] = cur.fetchone()[0]
+        
+        cur.close()
+        conn.close()
+        
+    except Exception as e:
+        print(f"[WARN] Metrics collection error: {e}")
     
     return metrics
 
@@ -310,7 +306,7 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None):
         batch_num = total_merged // batch_size + 1
         
         # Collect pre-batch metrics
-        pre_metrics = collect_metrics(cursor)
+        pre_metrics = collect_metrics()
         
         cursor.execute("""
             SELECT id
@@ -368,7 +364,7 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None):
         total_merged += len(batch_ids)
         
         # Collect post-batch metrics
-        post_metrics = collect_metrics(cursor)
+        post_metrics = collect_metrics()
         post_metrics['timestamp'] = time.time() - start_time
         post_metrics['batch'] = batch_num
         post_metrics['batch_time'] = batch_time
@@ -604,7 +600,7 @@ def main():
     print()
     
     print("=== FINAL DATABASE STATE ===")
-    final_metrics = collect_metrics(cursor)
+    final_metrics = collect_metrics()
     print(f"DB Size: {final_metrics.get('db_size_mb', 'N/A')}MB")
     print(f"Table sizes:")
     print(f"  - custody_position: {final_metrics.get('custody_position_size', 'N/A')} "
