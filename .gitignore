@@ -24,3 +24,5 @@ data/input/*.parquet
 *.png
 *.csv
 *.html
+# Simulation reports
+reports/
