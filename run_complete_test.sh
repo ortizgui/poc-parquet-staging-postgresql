@@ -39,6 +39,7 @@ MERGE_DELAY=0.5
 KEEP_DOCKER=false
 DO_SEED=true
 CSV_OUTPUT="reports/metrics_complete_$(date +%Y%m%d_%H%M%S).csv"
+CSV_METRICS="reports/metrics_batches_$(date +%Y%m%d_%H%M%S).csv"
 
 # Cores
 RED='\033[0;31m'
@@ -318,34 +319,8 @@ collect_and_report() {
     local staging_final=$(run_psql -t -c "SELECT COUNT(*) FROM custody_position_staging" | tr -d ' ')
     local principal_final=$(run_psql -t -c "SELECT COUNT(*) FROM custody_position" | tr -d ' ')
     local error_final=$(run_psql -t -c "SELECT COUNT(*) FROM custody_position_error" | tr -d ' ')
-
     local expected_total=$((NUM_FILES * RECORDS_PER_FILE))
-
-    # Write CSV with metrics
-    cat > "$CSV_OUTPUT" << METRICSEOF
-metric,value
-total_files,$NUM_FILES
-records_per_file,$RECORDS_PER_FILE
-total_records_expected,$expected_total
-staging_final,$staging_final
-principal_final,$principal_final
-error_final,$error_final
-existing_records,$EXISTING_RECORDS
-merge_batch_size,$MERGE_BATCH_SIZE
-merge_delay,$MERGE_DELAY
-METRICSEOF
-
-    success "Metricas salvas em $CSV_OUTPUT"
-
-    # Generate HTML report
-    log "Gerando relatorio HTML..."
-    local report_output="${CSV_OUTPUT%.csv}_report.html"
-    python3 scripts/generate_report.py "$CSV_OUTPUT" 2>/dev/null
-
-    if [ -f "metrics_report.html" ]; then
-        mv metrics_report.html "$report_output"
-        success "Relatorio HTML: $report_output"
-    fi
+    local inserted_new=$((principal_final - EXISTING_RECORDS))
 
     # Print summary
     echo ""
@@ -357,10 +332,19 @@ METRICSEOF
     echo "  Total registros:        $expected_total"
     echo "  Registros existentes:   $EXISTING_RECORDS"
     echo "  Staging (restante):     $staging_final"
-    echo "  Principal (final):      $principal_final"
+    echo "  Principal (final):     $principal_final"
     echo "  Erros:                  $error_final"
-    echo "  Validos inseridos:      $((principal_final - EXISTING_RECORDS))"
+    echo "  Novos inseridos:       $inserted_new"
     echo "=============================================="
+
+    # Generate HTML report from batch metrics CSV
+    if [ -f "$CSV_METRICS" ]; then
+        log "Gerando relatorio HTML..."
+        local report_output="${CSV_METRICS%.csv}_report.html"
+        python3 scripts/generate_report.py "$CSV_METRICS" --output "$report_output" 2>&1 && success "Relatorio HTML: $report_output" || warn "Falha ao gerar HTML"
+    else
+        warn "CSV de metricas nao encontrado: $CSV_METRICS"
+    fi
 }
 
 # =============================================================================
@@ -401,7 +385,7 @@ main() {
     log "Iniciando merge job em background (modo continuo)..."
     source .venv/bin/activate
     MERGE_BATCH_SIZE=$MERGE_BATCH_SIZE MERGE_DELAY_SECONDS=$MERGE_DELAY \
-        python3 scripts/merge_staging.py --continuous &
+        python3 scripts/merge_staging.py --continuous --metrics-csv "$CSV_METRICS" &
     MERGE_PID=$!
     success "Merge job started (PID=$MERGE_PID, continuous mode)"
 

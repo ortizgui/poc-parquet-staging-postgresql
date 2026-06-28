@@ -24,6 +24,7 @@ Uso:
 """
 
 import argparse
+import csv
 import os
 import signal
 import sys
@@ -104,7 +105,7 @@ def merge_batch(conn, cur, batch_ids):
     return inserted, updated, deleted
 
 
-def run_merge_cycle(conn, cur, batch_size, delay_seconds, stats):
+def run_merge_cycle(conn, cur, batch_size, delay_seconds, stats, csv_writer=None, csv_file=None):
     """Executa um ciclo de merge (busca e processa um batch)."""
     # Seleciona próximo batch
     cur.execute("""
@@ -140,6 +141,22 @@ def run_merge_cycle(conn, cur, batch_size, delay_seconds, stats):
         print(f"  [BATCH {stats['batch_num']}] +{inserted}ins ~{updated}upd -{deleted}del | "
               f"{batch_time*1000:.0f}ms | {throughput:.0f} regs/s")
 
+        if csv_writer:
+            csv_writer.writerow({
+                'timestamp': elapsed,
+                'batch': stats['batch_num'],
+                'batch_time_ms': batch_time * 1000,
+                'inserted': inserted,
+                'updated': updated,
+                'total_processed': stats['total_inserted'] + stats['total_updated'],
+                'pending_locks': 0,
+                'dead_custody': 0,
+                'dead_staging': 0,
+                'cache_hit_ratio': 0,
+                'long_transactions': 0
+            })
+            csv_file.flush()
+
         # Throttle entre batches
         if delay_seconds > 0:
             time.sleep(delay_seconds)
@@ -166,6 +183,8 @@ def main():
                         help=f"Batch size (default: {BATCH_SIZE})")
     parser.add_argument("--delay", type=float, default=MERGE_DELAY_SECONDS,
                         help=f"Delay between batches in seconds (default: {MERGE_DELAY_SECONDS})")
+    parser.add_argument("--metrics-csv", type=str, default="",
+                        help="Output CSV file for batch metrics")
     args = parser.parse_args()
     
     batch_size = args.batch_size
@@ -198,6 +217,16 @@ def main():
             return
 
         print(f"[MERGE] Lock acquired.")
+        csv_file = None
+        csv_writer = None
+        if args.metrics_csv:
+            csv_file = open(args.metrics_csv, 'w', newline='')
+            csv_writer = csv.DictWriter(csv_file, fieldnames=[
+                'timestamp', 'batch', 'batch_time_ms', 'inserted', 'updated',
+                'total_processed', 'pending_locks', 'dead_custody', 'dead_staging',
+                'cache_hit_ratio', 'long_transactions'
+            ])
+            csv_writer.writeheader()
         print(f"[MERGE] Config: batch_size={batch_size}, delay={delay_seconds}s")
         if continuous:
             print(f"[MERGE] Mode: CONTINUOUS (Ctrl+C to stop)")
@@ -236,7 +265,7 @@ def main():
                 break
             
             # Executa um ciclo de merge
-            had_work = run_merge_cycle(conn, cur, batch_size, delay_seconds, stats)
+            had_work = run_merge_cycle(conn, cur, batch_size, delay_seconds, stats, csv_writer, csv_file)
             
             if not had_work:
                 if continuous:
@@ -270,6 +299,8 @@ def main():
             print("[MERGE] Lock released.")
         except:
             print("[MERGE] Lock release failed (already released or error)")
+        if csv_file:
+            csv_file.close()
         cur.close()
         conn.close()
 
