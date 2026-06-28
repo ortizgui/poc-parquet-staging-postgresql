@@ -1,8 +1,8 @@
 """Generate a single HTML report from simulation CSV metrics.
 
 Usage:
-    python3 scripts/generate_report.py metrics.csv
-    python3 scripts/generate_report.py metrics.csv --output report.html
+    python3 scripts/generate_report.py reports/metrics.csv
+    python3 scripts/generate_report.py reports/metrics.csv --output custom.html
 """
 
 import argparse
@@ -16,8 +16,15 @@ def generate_report(csv_file, output_file=None):
     df = pd.read_csv(csv_file)
     
     if output_file is None:
+        # Preserve the same directory as the CSV
+        csv_dir = os.path.dirname(csv_file)
         base_name = os.path.splitext(os.path.basename(csv_file))[0]
-        output_file = f"{base_name}_report.html"
+        output_file = os.path.join(csv_dir, f"{base_name}_report.html") if csv_dir else f"{base_name}_report.html"
+    
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     
     # Calculate summary statistics
     total_records = df['total_processed'].max() if 'total_processed' in df.columns else 0
@@ -53,30 +60,18 @@ def generate_report(csv_file, output_file=None):
         .chart-container {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
         .chart-container h3 {{ color: #34495e; margin-bottom: 15px; font-size: 16px; }}
         .charts-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 20px; }}
-        .charts-row {{ display: grid; grid-template-columns: 1fr; gap: 20px; }}
         img {{ width: 100%; height: auto; border-radius: 5px; }}
-        .summary {{ background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 30px; }}
-        .summary h3 {{ margin-bottom: 15px; }}
-        .summary ul {{ list-style: none; }}
-        .summary li {{ padding: 8px 0; border-bottom: 1px solid #eee; }}
-        .summary li:last-child {{ border-bottom: none; }}
-        .summary .label {{ color: #7f8c8d; }}
-        .summary .value {{ font-weight: bold; color: #2c3e50; float: right; }}
         .footer {{ text-align: center; color: #7f8c8d; padding: 20px; font-size: 12px; }}
-        .tag {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }}
-        .tag.success {{ background: #d4edda; color: #155724; }}
-        .tag.warning {{ background: #fff3cd; color: #856404; }}
-        .tag.danger {{ background: #f8d7da; color: #721c24; }}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>📊 Load Simulation Report</h1>
+            <h1>Load Simulation Report</h1>
             <div class="date">Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</div>
         </div>
         
-        <h2>📈 Resumo</h2>
+        <h2>Resumo</h2>
         <div class="metrics-grid">
             <div class="metric-card highlight">
                 <div class="label">Registros Processados</div>
@@ -104,21 +99,15 @@ def generate_report(csv_file, output_file=None):
             </div>
         </div>
         
-        <h2>🔒 Status de Lock</h2>
+        <h2>Status de Lock</h2>
         <div class="metrics-grid">
             <div class="metric-card">
                 <div class="label">Máximo Pending Locks</div>
                 <div class="value">{max_locks}</div>
             </div>
-            <div class="metric-card">
-                <div class="label">Status</div>
-                <div class="value">
-                    {"<span class='tag success'>Sem Lock Contention</span>" if max_locks == 0 else "<span class='tag warning'>Com Lock</span>"}
-                </div>
-            </div>
         </div>
         
-        <h2>📊 Gráficos</h2>
+        <h2>Gráficos</h2>
         
         <h3>Throughput por Batch</h3>
         <div class="chart-container">
@@ -127,18 +116,14 @@ def generate_report(csv_file, output_file=None):
         
         <div class="charts-grid">
             <div class="chart-container">
-                <h3>Registros por Batch</h3>
+                <h3>Registros Inserted por Batch</h3>
                 <img src="data:image/png;base64,{generate_chart(df, 'timestamp', 'inserted', 'Inserted', 'Tempo (s)', 'regs')}" alt="Inserted">
             </div>
             <div class="chart-container">
-                <h3>Updates por Batch</h3>
+                <h3>Registros Updated por Batch</h3>
                 <img src="data:image/png;base64,{generate_chart(df, 'timestamp', 'updated', 'Updated', 'Tempo (s)', 'regs')}" alt="Updated">
             </div>
         </div>
-        
-        {generate_dead_tuples_chart(df) if has_dead_tuples(df) else ''}
-        
-        {generate_cache_chart(df) if has_cache_data(df) else ''}
         
         <div class="footer">
             Load Simulation Report | POC Parquet Staging PostgreSQL
@@ -159,6 +144,7 @@ def generate_chart(df, x_col, y_col, ylabel, xlabel, unit):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from io import BytesIO
     
     plt.figure(figsize=(10, 5))
     plt.plot(df[x_col], df[y_col], 'b-', linewidth=2, marker='o', markersize=4)
@@ -167,7 +153,6 @@ def generate_chart(df, x_col, y_col, ylabel, xlabel, unit):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     
-    from io import BytesIO
     buffer = BytesIO()
     plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
     plt.close()
@@ -175,89 +160,6 @@ def generate_chart(df, x_col, y_col, ylabel, xlabel, unit):
     buffer.seek(0)
     import base64
     return base64.b64encode(buffer.read()).decode()
-
-
-def has_dead_tuples(df):
-    return 'dead_custody' in df.columns or 'dead_buffer' in df.columns
-
-
-def has_cache_data(df):
-    return 'cache_hit_ratio' in df.columns and df['cache_hit_ratio'].notna().any()
-
-
-def generate_dead_tuples_chart(df):
-    """Generate dead tuples chart if data available."""
-    if not has_dead_tuples(df):
-        return ""
-    
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from io import BytesIO
-    import base64
-    
-    plt.figure(figsize=(10, 5))
-    
-    if 'dead_custody' in df.columns:
-        plt.plot(df['timestamp'], df['dead_custody'], 'b-', linewidth=2, label='Principal', marker='o', markersize=4)
-    if 'dead_buffer' in df.columns:
-        plt.plot(df['timestamp'], df['dead_buffer'], 'orange', linewidth=2, label='Staging', marker='s', markersize=4)
-    
-    plt.xlabel('Tempo (s)')
-    plt.ylabel('Dead Tuples')
-    plt.title('Acúmulo de Dead Tuples')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-    plt.close()
-    buffer.seek(0)
-    
-    chart_base64 = base64.b64encode(buffer.read()).decode()
-    
-    return f"""
-        <h3>Dead Tuples</h3>
-        <div class="chart-container">
-            <img src="data:image/png;base64,{chart_base64}" alt="Dead Tuples">
-        </div>
-    """
-
-
-def generate_cache_chart(df):
-    """Generate cache hit ratio chart if data available."""
-    if not has_cache_data(df):
-        return ""
-    
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from io import BytesIO
-    import base64
-    
-    plt.figure(figsize=(10, 5))
-    plt.plot(df['timestamp'], df['cache_hit_ratio'], 'g-', linewidth=2, marker='o', markersize=4)
-    plt.xlabel('Tempo (s)')
-    plt.ylabel('Cache Hit Ratio (%)')
-    plt.title('Cache Hit Ratio')
-    plt.ylim(0, 100)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-    plt.close()
-    buffer.seek(0)
-    
-    chart_base64 = base64.b64encode(buffer.read()).decode()
-    
-    return f"""
-        <h3>Cache Hit Ratio</h3>
-        <div class="chart-container">
-            <img src="data:image/png;base64,{chart_base64}" alt="Cache Hit Ratio">
-        </div>
-    """
 
 
 def main():
