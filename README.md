@@ -49,7 +49,7 @@ flowchart TD
        ↓
 3. ECS: Lê parquet e faz bulk insert na staging table
        ↓
-4. Staging: Dados aguardam processamento (PENDING)
+4. Staging: Dados aguardam processamento
        ↓
 5. Cron: merge_staging.py roda a cada X segundos
        ↓
@@ -73,31 +73,50 @@ flowchart TD
 | `process_file.py` | Lê parquet do S3 e insere na staging |
 | `merge_staging.py` | Merge da staging para principal (batch + throttle) |
 | `simulate_load.py` | Simula carga para validação |
+| `generate_report.py` | Gera relatório HTML das métricas |
 | `seed_database.py` | Preenche base com dados de teste |
-| `generate_charts.py` | Gera gráficos das métricas |
+| `setup_infra.py` | Cria infraestrutura S3/SNS/SQS no LocalStack |
 
 ## Uso
 
-### 1. Processar arquivo Parquet (ECS/Consumer)
+### 1. Setup
 
 ```bash
-python3 scripts/process_file.py \
-    --bucket poc-bucket \
-    --key input/custody_position.parquet
+# Subir serviços
+docker compose up -d
+
+# Criar tabelas
+psql -h localhost -U pocuser -d pocdb -f sql/001_init.sql
+
+# Setup infraestrutura (S3, SNS, SQS)
+python3 scripts/setup_infra.py
 ```
 
-### 2. Merge para tabela principal (Cron)
+### 2. Processar arquivo Parquet (ECS/Consumer)
 
 ```bash
-# Configurações via ambiente
-export MERGE_BATCH_SIZE=2000
-export MERGE_DELAY_SECONDS=0.5
+# Gerar arquivo de exemplo
+python3 scripts/create_sample_file.py
+python3 scripts/upload_to_s3.py
 
-# Executar merge
+# Simular notificação SNS
+python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
+
+# Processar parquet (insere na staging)
+python3 scripts/process_file.py --bucket poc-bucket --key input/custody_position.parquet
+```
+
+### 3. Merge para tabela principal (Cron)
+
+```bash
+# Com configurações padrão
 python3 scripts/merge_staging.py
+
+# Ou com configurações customizadas
+MERGE_BATCH_SIZE=2000 MERGE_DELAY_SECONDS=0.5 python3 scripts/merge_staging.py
 ```
 
-### 3. Simular carga de produção
+### 4. Simular carga de produção
 
 ```bash
 python3 scripts/simulate_load.py \
@@ -106,21 +125,55 @@ python3 scripts/simulate_load.py \
     --update-ratio 60 \
     --batch-size 2000 \
     --delay 0.5 \
-    --concurrent-ops 50 \
     --output-csv metrics.csv
 ```
+
+### 5. Gerar relatório HTML
+
+```bash
+python3 scripts/generate_report.py metrics.csv
+```
+
+## Parâmetros
+
+### simulate_load.py
+
+| Parâmetro | Default | Descrição |
+|-----------|---------|-----------|
+| `--existing-records` | 100000 | Registros já existentes na tabela principal |
+| `--ingestion-size` | 10000 | Quantidade de registros para ingestação |
+| `--update-ratio` | 60 | % de registros que atualizarão dados existentes |
+| `--batch-size` | 2000 | Tamanho do batch de merge |
+| `--delay` | 0.5 | Delay entre batches (segundos) |
+| `--output-csv` | "" | Arquivo CSV para métricas |
+
+### merge_staging.py
+
+| Variável | Default | Descrição |
+|----------|---------|-----------|
+| `MERGE_BATCH_SIZE` | 2000 | Registros por batch |
+| `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches |
+
+## Métricas e Relatórios
+
+O `simulate_load.py` gera um CSV com métricas que pode ser convertido em relatório HTML:
+
+```bash
+# Gerar relatório
+python3 scripts/generate_report.py metrics.csv
+
+# Abrir no navegador
+open metrics_report.html
+```
+
+O relatório inclui:
+- Resumo de métricas (total registros, throughput, tempo)
+- Gráficos de performance
+- Status de lock e dead tuples
 
 ## Merge Staging (merge_staging.py)
 
 Este script é destinado a rodar como CRON/JobScheduler.
-
-### Características
-
-- **Batch size configurável**: Processa N registros por vez
-- **Delay entre batches**: Pausa para não impactar operações concorrentes
-- **Advisory lock**: Evita execuções concorrentes
-- **Idempotente**: Não processa o mesmo registro duas vezes
-- **Métricas**: Tempo, throughput, progresso
 
 ### Fluxo do Merge
 
@@ -134,109 +187,37 @@ Para cada batch:
   6. SLEEP (delay configurável)
 ```
 
-### Configuração
+### Características
 
-| Variável | Default | Descrição |
-|----------|---------|-----------|
-| `MERGE_BATCH_SIZE` | 2000 | Registros por batch |
-| `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches |
+- **Batch size configurável**: Processa N registros por vez
+- **Delay entre batches**: Pausa para não impactar operações concorrentes
+- **Advisory lock**: Evita execuções concorrentes
+- **Idempotente**: Não processa o mesmo registro duas vezes
+- **Métricas**: Tempo, throughput, progresso
 
-## Simulação de Carga (simulate_load.py)
+## Resultados dos Testes
 
-Ferramenta para simular carga de produção e validar configurações antes de deploy.
-
-### Cenários de Teste
-
-```bash
-# Teste leve (validação rápida)
-python3 scripts/simulate_load.py \
-    --existing-records 10000 \
-    --ingestion-size 1000 \
-    --update-ratio 60
-
-# Teste moderado (1M registros, 5 ops/s concorrência)
-python3 scripts/simulate_load.py \
-    --existing-records 500000 \
-    --ingestion-size 1000000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5 \
-    --concurrent-ops 5
-
-# Teste agressivo (1M registros, 50 ops/s concorrência)
-python3 scripts/simulate_load.py \
-    --existing-records 500000 \
-    --ingestion-size 1000000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5 \
-    --concurrent-ops 50
-```
-
-### Métricas Coletadas
-
-- **Throughput**: Registros processados por segundo
-- **Latência P95**: Tempo de resposta das operações concorrentes
-- **Pending Locks**: Lock contention (0 = ideal)
-- **Dead Tuples**: Tuplas mortas após UPDATE (normal)
-- **Cache Hit Ratio**: Eficiência do cache PostgreSQL
-
-### Resultados dos Testes
-
-#### Teste: 50 ops/s concorrência
+### Teste: 1M registros, 60% updates
 
 | Métrica | Valor |
 |---------|-------|
 | Total Time | ~5 min |
 | Throughput | ~3,000 regs/s |
-| Errors | 0 |
-| P95 Latency | ~60ms |
 | Pending Locks | 0 |
+| Dead Tuples | Normal (limpo por autovacuum) |
 
-#### Estimativa Aurora
+### Estimativa Aurora
 
 | Instância | 1M registros | 4M registros |
 |-----------|-------------|--------------|
 | r6g.xlarge (4 vCPU, 32GB) | ~12 min | ~46 min |
-
-## Geração de Gráficos
-
-```bash
-# Instalar dependências
-pip install matplotlib pandas
-
-# Gerar gráficos
-python3 scripts/generate_charts.py metrics.csv --output ./charts
-
-# Abrir dashboard
-open charts/metrics_dashboard.png
-```
-
-## Merge Throttling (Controle de Impacto)
-
-Para ambientes de produção com outras operações simultâneas, o merge pode ser configurado para reduzir impacto.
-
-### Configuração
-
-| Variável | Default | Descrição |
-|----------|---------|-----------|
-| `MERGE_BATCH_SIZE` | 2000 | Quantidade de registros por batch |
-| `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches (segundos) |
-
-### Cálculo do Sweet Spot
-
-| Batch Size | Delay | Impacto BD | Tempo (4M) |
-|------------|-------|------------|------------|
-| 500 | 1.0s | Mínimo | ~3.5h |
-| **2000** | **0.5s** | **Baixo** | **~1h** |
-| 5000 | 0.3s | Médio | ~30min |
 
 ## Padrões de Resiliencia
 
 ### Idempotência
 
 - Unique constraint em `(source_file, row_number)` garante que mesmo parquet processado 2x não duplica
-- Merge usa DELETE após sucesso, não marca status
+- Merge usa DELETE após sucesso
 
 ### Retry
 
@@ -248,20 +229,10 @@ Para ambientes de produção com outras operações simultâneas, o merge pode s
 - Registros inválidos vão para `custody_position_error`
 - Payload JSONB preserva dados originais para investigação
 
-## Stack
-
-| Componente | Tecnologia |
-|------------|-----------|
-| Database | PostgreSQL 16 |
-| Object Storage | AWS S3 (LocalStack) |
-| Notifications | AWS SNS |
-| Compute | ECS Fargate (simulado localmente) |
-| Language | Python 3.12 |
-
 ## Setup Local
 
 ```bash
-# Subir serviços
+# Subir servicos
 docker compose up -d
 
 # Criar tabelas
@@ -277,9 +248,22 @@ python3 scripts/upload_to_s3.py
 # Simular notificação
 python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
 
-# Processar parquet (ECS)
+# Processar parquet
 python3 scripts/process_file.py --bucket poc-bucket --key input/custody_position.parquet
 
-# Merge para principal (Cron)
+# Merge
 python3 scripts/merge_staging.py
+
+# Simular carga
+python3 scripts/simulate_load.py --existing-records 500000 --ingestion-size 1000000 --update-ratio 60
 ```
+
+## Stack
+
+| Componente | Tecnologia |
+|------------|-----------|
+| Database | PostgreSQL 16 |
+| Object Storage | AWS S3 (LocalStack) |
+| Notifications | AWS SNS |
+| Compute | ECS Fargate (simulado localmente) |
+| Language | Python 3.12 |
