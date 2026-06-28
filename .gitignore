@@ -22,3 +22,5 @@ data/input/*.parquet
 # Images
 
 *.png
+*.csv
+*.html
