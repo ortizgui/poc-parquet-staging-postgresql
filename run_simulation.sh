@@ -101,8 +101,8 @@ parse_args() {
                 echo "  --batch NUM      Batch size (default: $BATCH_SIZE)"
                 echo "  --delay NUM      Delay entre batches em segundos (default: $DELAY)"
                 echo "  --output FILE    Nome do arquivo CSV de saída"
-                echo "  --keep-docker    Não recria Docker (mais rápido, reuse containers)"
-                echo "  --report-only    Apenas gera relatório do último CSV"
+                echo "  --keep-docker   Não recria Docker (mais rápido, reuse containers)"
+                echo "  --report-only   Apenas gera relatório do último CSV"
                 echo "  --help, -h      Mostra esta ajuda"
                 exit 0
                 ;;
@@ -144,13 +144,25 @@ check_prerequisites() {
         exit 1
     fi
     
-    # Verifica psql
+    # psql é OPCIONAL - usaremos o do container Docker
     if ! command -v psql &> /dev/null; then
-        error "psql não encontrado. Instale o cliente PostgreSQL."
-        exit 1
+        warn "psql não encontrado localmente. Usaremos o psql do container Docker."
     fi
     
     success "Pré-requisitos OK"
+}
+
+# =============================================================================
+# Executa comando no PostgreSQL (via Docker ou local)
+# =============================================================================
+run_psql() {
+    if command -v psql &> /dev/null; then
+        # Usa psql local
+        psql "$@"
+    else
+        # Usa psql do container Docker
+        docker compose exec -T postgres psql -U pocuser -d pocdb "$@"
+    fi
 }
 
 # =============================================================================
@@ -190,7 +202,7 @@ setup_docker() {
     local max_attempts=30
     local attempt=0
     while [ $attempt -lt $max_attempts ]; do
-        if docker compose exec -T postgres pg_isready -U pocuser -d pocdb &>/dev/null; then
+        if run_psql -c "SELECT 1" &>/dev/null; then
             success "PostgreSQL está pronto!"
             return
         fi
@@ -236,7 +248,7 @@ setup_database() {
     
     # Recria as tabelas (sempre)
     log "Criando tabelas..."
-    docker compose exec -T postgres psql -U pocuser -d pocdb -f /docker-entrypoint-initdb.d/001_init.sql
+    run_psql -f sql/001_init.sql
     
     success "Banco de dados pronto"
 }
@@ -257,7 +269,7 @@ run_simulation() {
     log "  % Updates:           $UPDATE_RATIO%"
     log "  Batch size:          $BATCH_SIZE"
     log "  Delay entre batches:  ${DELAY}s"
-    log "  Output CSV:          $CSV_OUTPUT"
+    log "  Output CSV:           $CSV_OUTPUT"
     log ""
     log "=============================================="
     
