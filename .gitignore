@@ -18,3 +18,7 @@ data/input/*.parquet
 
 # OS
 .DS_Store
+
+# Images
+
+*.png

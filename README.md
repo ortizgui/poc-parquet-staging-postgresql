@@ -1,336 +1,105 @@
-# POC v3 — Ingestao Resiliente: S3 -> SNS -> SQS -> Buffer -> Merge
+# POC — Ingestão Massiva de Dados: Parquet → Staging → Principal
 
-Prova de conceito do fluxo completo com SNS, DLQ, buffer table e merge.
+Prova de conceito do fluxo de ingestão massiva de dados com staging table e merge controlado.
 
 ## Arquitetura
 
 ```mermaid
 flowchart TD
-    subgraph AWS [AWS - LocalStack]
-        S3[(S3 Bucket<br/>poc-bucket)]
-        SNS[SNS Topic<br/>poc-notification-topic]
-        SQS1[SQS #1<br/>poc-notification-queue<br/>DLQ: maxReceiveCount=3]
-        SQS2[SQS #2<br/>poc-record-queue<br/>DLQ: maxReceiveCount=5]
-        DLQ1[poc-notification-dlq]
-        DLQ2[poc-record-dlq]
+    subgraph S3 ["S3 (Origem dos Dados)"]
+        PARQUET[Arquivos Parquet<br/>até 5.000 registros cada]
     end
 
-    subgraph ECS1 [ECS Service 1 - consume_s3_event]
-        LER[Read notification<br/>bucket + key]
-        PARQUET[Read Parquet streaming<br/>s3fs + row groups<br/>Range GET]
-        ENVIAR[Send each record<br/>to SQS #2<br/>batches of 10]
+    subgraph SNS ["SNS (Notificação)"]
+        NOTIFICATION[SNS Topic<br/>Notifica novo arquivo]
     end
 
-    subgraph ECS2 [ECS Service 2 - consume_records_to_db]
-        RECEBER[Receive up to 10 msgs<br/>long polling 5s]
-        VALIDAR[Validate each record<br/>account_id, asset_id,<br/>quantity, amount]
-        BATCH[Batch INSERT<br/>execute_values]
-        DELETAR[Delete msgs<br/>after COMMIT]
+    subgraph ECS ["ECS Service (Consumer)"]
+        CONSUMER[Consumer ECS<br/>Lê Parquet<br/>Bulk INSERT<br/>Staging Table]
     end
 
-    subgraph DB [PostgreSQL - pocdb]
-        BUFFER[custody_position_buffer<br/>PENDING -> MERGED -> cleanup]
-        ERRO[custody_position_error<br/>payload + reason]
-        FINAL[custody_position<br/>final table]
+    subgraph STAGING ["PostgreSQL - Staging"]
+        STAGING_TABLE[custody_position_staging<br/>Landing Zone<br/>Append-only<br/>Idempotente]
+        ERROR_TABLE[custody_position_error<br/>Registros inválidos]
     end
 
-    subgraph MERGE [Merge - merge_buffer]
-        UPSERT[Batch upsert<br/>INSERT WHERE NOT EXISTS<br/>UPDATE via JOIN IS DISTINCT FROM<br/>FOR UPDATE SKIP LOCKED<br/>pg_advisory_lock 42]
-        CLEANUP[Delete MERGED records<br/>from buffer table]
+    subgraph CRON ["Merge Job (Cron/Scheduler)"]
+        MERGE[merge_staging.py<br/>Batch Upsert<br/>INSERT/UPDATE<br/>DELETE from Staging]
     end
 
-    S3 -->|S3 Event Notification<br/>ObjectCreated:Put| SNS
-    SNS -->|fanout| SQS1
-    SQS1 -->|poll + delete| LER
-    SQS1 -.->|exceeds 3 retries| DLQ1
-    LER --> PARQUET
-    PARQUET --> ENVIAR
-    ENVIAR --> SQS2
-    SQS2 -.->|exceeds 5 retries| DLQ2
+    subgraph PRINCIPAL ["PostgreSQL - Principal"]
+        FINAL_TABLE[custody_position<br/>Tabela Final<br/>Produção]
+    end
 
-    SQS2 -->|poll 10 msgs| RECEBER
-    RECEBER --> VALIDAR
-    VALIDAR -->|valid| BATCH
-    VALIDAR -->|invalid| BATCH
-    BATCH -->|COMMIT| DELETAR
-
-    BATCH -->|valid rows| BUFFER
-    BATCH -->|invalid rows| ERRO
-
-    BUFFER -->|status = PENDING| UPSERT
-    UPSERT -->|upsert| FINAL
-    UPSERT -->|mark MERGED| CLEANUP
-    CLEANUP -->|DELETE MERGED| BUFFER
+    PARQUET -->|S3 Event| SNS
+    SNS -->|Fanout| CONSUMER
+    CONSUMER -->|Bulk INSERT| STAGING_TABLE
+    CONSUMER -->|Invalid Rows| ERROR_TABLE
+    STAGING_TABLE -->|Merge em batches| MERGE
+    MERGE -->|INSERT/UPDATE| FINAL_TABLE
+    MERGE -->|DELETE merged| STAGING_TABLE
 ```
 
-## Padroes de Resiliencia
-
-### Dead Letter Queues (DLQs)
-- SQS #1 DLQ: `poc-notification-dlq` — mensagens que falharam apos 3 tentativas
-- SQS #2 DLQ: `poc-record-dlq` — registros que falharam apos 5 tentativas
-- Recuperacao: reposicionar da DLQ para a fila original apos corrigir a causa
-
-### SNS Fanout
-- S3 -> SNS -> SQS #1: SNS permite multiplos subscribers (outras filas, Lambda, etc.)
-- Simulation: `simulate_s3_notification.py` publica no topico SNS
-
-### Retry com Backoff
-- Consumer 1: retry exponencial para leitura S3 (1s, 2s, 4s)
-- Consumer 2: retry para falhas de conexao DB
-- Visibility timeout: 30s para que mensagens voltem automaticamente
-
-### Processamento Parcial de Lotes
-- Consumer 2 processa validos e invalidos no mesmo lote
-- Validos -> buffer table. Invalidos -> error table.
-- COMMIT so apos ambos INSERTs bem-sucedidos
-
-### Merge com Advisory Lock
-- `pg_advisory_lock(42)` previne merges concorrentes
-- `FOR UPDATE SKIP LOCKED` para processamento paralelo seguro
-- Lotes de 10.000 registros
-- UPDATE condicional: so altera registros se `quantity` ou `amount` mudaram
-  (`IS DISTINCT FROM` evita writes desnecessarios e preserva `updated_at`)
-
-### Cleanup da Buffer Table
-- Apos o merge, registros com `status = 'MERGED'` sao deletados da buffer table
-- A buffer table mantém apenas registros `PENDING` (aguardando merge) e erros
-
-## Stack
-
-| Componente | Imagem / Lib | Funcao |
-|-----------|-------------|--------|
-| PostgreSQL | postgres:16 | Buffer + Final tables |
-| LocalStack | localstack/localstack | S3 + SQS + SNS |
-| ECS Service 1 | consumer1 (Python) | SQS->Parquet->SQS |
-| ECS Service 2 | consumer2 (Python) | SQS->Buffer table |
-| Merge Job | merge (Python) | Buffer->Final |
-| SNS | LocalStack | Event notification fanout |
-
-## Pre-requisitos
-
-- Docker e Docker Compose
-- Python 3.12+
-
-## Setup
-
-```bash
-# Subir servicos
-docker compose up -d
-
-# Verificar saude
-docker compose ps
-
-# Criar e ativar ambiente Python (para scripts locais, opcional)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-## Execucao Passo a Passo
-
-```bash
-# 1. Gerar arquivo Parquet de exemplo
-python3 scripts/create_sample_file.py
-
-# 2. Enviar para S3 local
-python3 scripts/upload_to_s3.py
-
-# 3. Setup da infraestrutura (SNS, SQS, DLQs, subscriptions)
-python3 scripts/setup_infra.py
-
-# 4. Simular S3 Event Notification -> SNS -> SQS #1
-python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
-
-# 5. ECS Service 1: SQS #1 -> Parquet -> SQS #2
-python3 scripts/consume_s3_event.py
-
-# 6. ECS Service 2: SQS #2 -> Buffer table
-python3 scripts/consume_records_to_db.py
-
-# 7. Merge Buffer -> Final table
-python3 scripts/merge_buffer.py
-```
-
-### Execucao com Docker Compose
-
-```bash
-# Apos setup_infra.py + simulate_s3_notification.py:
-docker compose up consumer1    # Terminal 1
-docker compose up consumer2    # Terminal 2
-docker compose up merge        # Terminal 3
-```
-
-## Idempotencia
-
-### Cenario 1: SNS entrega a mesma notificacao 2x
+## Fluxo de Dados
 
 ```
-SNS (at-least-once via SQS)
-  -> consume_s3_event.py processa 2x
-  -> SQS #2 recebe 48 mensagens (24 duplicadas)
-  -> consume_records_to_db.py:
-      ON CONFLICT (source_file, row_number) DO NOTHING
-      -> 20 validas na primeira, 0 na segunda
-  -> Dados nao duplicam. Processamento extra, mas dados consistentes.
+1. S3: Arquivos Parquet chegam (até 5.000 registros cada)
+       ↓
+2. SNS: Notificação enviada ao ECS Consumer
+       ↓
+3. ECS: Lê parquet e faz bulk insert na staging table
+       ↓
+4. Staging: Dados aguardam processamento (PENDING)
+       ↓
+5. Cron: merge_staging.py roda a cada X segundos
+       ↓
+6. Merge: INSERT novos + UPDATE modificados + DELETE da staging
+       ↓
+7. Principal: Dados disponíveis para aplicações
 ```
 
-### Cenario 2: Consumer morre antes de deletar da SQS #2
+## Tabelas
 
-```
-consume_records_to_db.py:
-  1. Recebe 10 mensagens
-  2. INSERT no DB com sucesso  <- CRASHOU
-  3. (nao deletou da SQS)
-  4. Visibilidade expira em 30s -> msgs voltam pra SQS #2
-  5. Outro consumer processa de novo
-  6. ON CONFLICT DO NOTHING -> buffer nao duplica
-  7. Desta vez, deleta da SQS apos COMMIT
-```
+| Tabela | Função |
+|--------|--------|
+| `custody_position_staging` | Landing zone para dados do parquet |
+| `custody_position_error` | Registros inválidos (com razão do erro) |
+| `custody_position` | Tabela final de produção |
 
-### Cenario 3: Merge roda 2x
-
-```
-merge_buffer.py:
-  - So processa WHERE status = 'PENDING'
-  - Apos merge: status = 'MERGED'
-  - Segunda execucao: 0 PENDING -> nada a fazer
-  - Advisory lock garante que apenas um merge executa por vez
-```
-
-## Matriz de Recuperacao de Erros
-
-| Problema | Causa | Efeito | Recuperacao |
-|----------|-------|--------|-------------|
-| SNS nao entrega | SNS indisponivel | Notificacao nao chega ao SQS #1 | Republicar no SNS |
-| SQS #1 vazia | Ninguem simulou notificacao | consume_s3_event encerra | Rodar simulate primeiro |
-| DLQ notificacao recebe msg | S3 read falhou 3x | Msg vai para DLQ | Investigar causa, redrive para fila original |
-| SQS #2 vazia | consume_s3_event nao rodou | consume_records encerra | Rodar consume_s3_event |
-| Consumer morre no INSERT | Timeout / OOM | Msgs voltam pra SQS #2 em 30s | Reprocessa automaticamente |
-| DLQ registros recebe msg | INSERT falhou 5x | Registros na DLQ | Investigar causa, redrive para fila original |
-| PostgreSQL cai | Container / Aurora failover | Consumer falha, msgs voltam | DB volta, msgs reprocessam |
-| LocalStack cai | `docker compose` parou | SQS + S3 + SNS indisponiveis | docker compose up -d |
-| Parquet corrompido | Dado de origem invalido | consume_s3_event falha apos retries | Corrigir, reenviar notificacao |
-| Schema mudou | Coluna nova no Parquet | Erro no consume_s3_event | Validar schema antes de ler |
-| Merge concorrente | 2+ instancias do merge_buffer.py | Segunda espera advisory lock | Libera quando primeira termina |
-| Merge trava com lock | Script morre sem unlock | Advisory lock fica preso | pg_advisory_unlock(42) ou reinicio da sessao |
-
-## Merge Throttling (Controle de Impacto)
-
-Para ambientes de produção com outras operações simultâneas, o merge pode ser configurado para reduzir impacto no BD.
-
-### Configuração
-
-| Variável | Default | Descrição |
-|----------|---------|-----------|
-| `MERGE_BATCH_SIZE` | 2000 | Quantidade de registros por batch |
-| `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches (segundos) |
-
-### Cálculo do Sweet Spot
-
-O objetivo é encontrar um ponto de equilíbrio entre tempo de processamento e impacto no BD:
-
-| Batch Size | Batches (4kk) | Delay | Tempo Total | Impacto BD |
-|------------|---------------|-------|-------------|------------|
-| 500 | 8.000 | 1.0s | ~3,5h | Mínimo |
-| **2000** | **2.000** | **0.5s** | **~1h** | **Baixo** |
-| 3000 | 1.333 | 0.3s | ~45min | Médio |
-| 5000 | 800 | 0.3s | ~30min | Médio |
-| 10000 | 400 | 0s | ~15min | Alto |
-
-### Tempos Estimados por Tamanho de Pico
-
-| Pico | BATCH=2000, DELAY=0.5s | BATCH=3000, DELAY=0.3s |
-|------|------------------------|------------------------|
-| 1kk | ~17 min | ~12 min |
-| 3kk | ~50 min | ~35 min |
-| 4kk | ~1h08min | ~45 min |
-
-### Recomendação
-
-Para ambientes Aurora com 36GB RAM e operações simultâneas:
-- **BATCH_SIZE=2000** com **DELAY=0.5s** é o sweet spot recomendado
-- Permite que outras operações passem entre batches
-- Tempo de processamento aceitável para picos de até 4kk
-
-### Configuração no .env
-
-```bash
-# Para ambiente de produção (menor impacto)
-MERGE_BATCH_SIZE=2000
-MERGE_DELAY_SECONDS=0.5
-
-# Para teste de velocidade (sem throttle)
-MERGE_BATCH_SIZE=10000
-MERGE_DELAY_SECONDS=0
-```
-
-## Load Simulation Tool
-
-Ferramenta para simular carga de produção e validar configurações de merge antes de deploy.
-
-### Scripts Disponíveis
+## Scripts Disponíveis
 
 | Script | Função |
 |--------|--------|
-| `scripts/seed_database.py` | Preenche tabela principal com dados base |
-| `scripts/simulate_load.py` | Executa simulação completa com métricas |
+| `process_file.py` | Lê parquet do S3 e insere na staging |
+| `merge_staging.py` | Merge da staging para principal (batch + throttle) |
+| `simulate_load.py` | Simula carga para validação |
+| `seed_database.py` | Preenche base com dados de teste |
+| `generate_charts.py` | Gera gráficos das métricas |
 
-### Parâmetros
+## Uso
 
-| Parâmetro | Default | Descrição |
-|-----------|---------|-----------|
-| `--existing-records` | 100000 | Registros já existentes na tabela principal |
-| `--ingestion-size` | 10000 | Quantidade de registros para ingestação (tamanho do bulk) |
-| `--update-ratio` | 60 | % de registros que atualizarão dados existentes |
-| `--batch-size` | 2000 | Tamanho do batch de merge |
-| `--delay` | 0.5 | Delay entre batches (segundos) |
-| `--concurrent-ops` | 0 | Simular N operações simultâneas por segundo durante merge |
-| `--output-csv` | "" | Arquivo CSV para salvar métricas (opcional) |
-
-### Entendendo os Parâmetros
-
-**`--ingestion-size`**: Representa o tamanho do bulk insert na tabela staging (buffer). 
-- 1M = bulk de 1 milhão de registros
-- Quanto maior, mais tempo o merge ficará rodando
-
-**`--update-ratio`**: Percentual de registros que farão UPDATE vs INSERT
-- 60% = 60% dos registros têm chave já existente na tabela principal
-- 40% = 40% são registros novos (INSERT)
-
-**`--batch-size`**: Quantidade de registros processados por transação no merge
-- Batch menor = menos lock por transação = mais suave para o BD
-- Batch maior = mais throughput, mas mais lock contention
-
-**`--delay`**: Pausa entre batches para permitir outras operações passarem
-- 0.5s = pausa de 500ms entre batches (recomendado para produção)
-- 0 = sem pausa (teste de performance máxima)
-
-**`--concurrent-ops`**: Simula operações concorrentes de outras aplicações
-- 0 = sem concorrência (teste isolado)
-- 5-10 = uso normal de outras aplicações
-- 50+ = pico de processamento, outras aplicações tentando escrever
-
-### Uso Básico
+### 1. Processar arquivo Parquet (ECS/Consumer)
 
 ```bash
-# Simular carga simples (já faz seed automático)
-python3 scripts/simulate_load.py \
-    --existing-records 500000 \
-    --ingestion-size 100000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5
+python3 scripts/process_file.py \
+    --bucket poc-bucket \
+    --key input/custody_position.parquet
+```
 
-# Simular carga com operações concorrentes (teste de impacto)
-python3 scripts/simulate_load.py \
-    --existing-records 500000 \
-    --ingestion-size 1000000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5 \
-    --concurrent-ops 50
+### 2. Merge para tabela principal (Cron)
 
-# Salvar métricas em CSV para análise
+```bash
+# Configurações via ambiente
+export MERGE_BATCH_SIZE=2000
+export MERGE_DELAY_SECONDS=0.5
+
+# Executar merge
+python3 scripts/merge_staging.py
+```
+
+### 3. Simular carga de produção
+
+```bash
 python3 scripts/simulate_load.py \
     --existing-records 500000 \
     --ingestion-size 1000000 \
@@ -338,13 +107,45 @@ python3 scripts/simulate_load.py \
     --batch-size 2000 \
     --delay 0.5 \
     --concurrent-ops 50 \
-    --output-csv metrics_test.csv
+    --output-csv metrics.csv
 ```
 
-**Nota:** `simulate_load.py` sempre trunca e re-seda a tabela principal antes da simulação,
-garantindo estado limpo. `seed_database.py` também sempre trunca antes de inserir.
+## Merge Staging (merge_staging.py)
 
-### Cenários de Teste Recomendados
+Este script é destinado a rodar como CRON/JobScheduler.
+
+### Características
+
+- **Batch size configurável**: Processa N registros por vez
+- **Delay entre batches**: Pausa para não impactar operações concorrentes
+- **Advisory lock**: Evita execuções concorrentes
+- **Idempotente**: Não processa o mesmo registro duas vezes
+- **Métricas**: Tempo, throughput, progresso
+
+### Fluxo do Merge
+
+```
+Para cada batch:
+  1. SELECT id FROM staging ORDER BY id LIMIT batch_size
+  2. INSERT novos registros na principal (ON CONFLICT DO NOTHING)
+  3. UPDATE registros existentes (apenas se mudou)
+  4. DELETE da staging (após sucesso)
+  5. COMMIT
+  6. SLEEP (delay configurável)
+```
+
+### Configuração
+
+| Variável | Default | Descrição |
+|----------|---------|-----------|
+| `MERGE_BATCH_SIZE` | 2000 | Registros por batch |
+| `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches |
+
+## Simulação de Carga (simulate_load.py)
+
+Ferramenta para simular carga de produção e validar configurações antes de deploy.
+
+### Cenários de Teste
 
 ```bash
 # Teste leve (validação rápida)
@@ -353,7 +154,7 @@ python3 scripts/simulate_load.py \
     --ingestion-size 1000 \
     --update-ratio 60
 
-# Teste médio (1M registros, 5 ops/s concorrência)
+# Teste moderado (1M registros, 5 ops/s concorrência)
 python3 scripts/simulate_load.py \
     --existing-records 500000 \
     --ingestion-size 1000000 \
@@ -370,261 +171,115 @@ python3 scripts/simulate_load.py \
     --batch-size 2000 \
     --delay 0.5 \
     --concurrent-ops 50
-
-# Teste de performance máxima (sem throttle)
-python3 scripts/simulate_load.py \
-    --existing-records 500000 \
-    --ingestion-size 1000000 \
-    --update-ratio 60 \
-    --batch-size 5000 \
-    --delay 0
 ```
 
 ### Métricas Coletadas
 
-#### Timing Results
-- **Total Time**: Tempo total do merge em segundos
 - **Throughput**: Registros processados por segundo
+- **Latência P95**: Tempo de resposta das operações concorrentes
+- **Pending Locks**: Lock contention (0 = ideal)
+- **Dead Tuples**: Tuplas mortas após UPDATE (normal)
+- **Cache Hit Ratio**: Eficiência do cache PostgreSQL
 
-#### Concurrent Operations Impact
-- **Total ops attempted**: Total de operações concorrentes executadas
-- **Errors**: Número de operações que falharam
-- **Avg/Max/P95 latency**: Latência das operações concorrentes
+### Resultados dos Testes
 
-#### Estimated Aurora Performance
-- **r6g.large (2 vCPU, 16GB)**: Estimativa para instância menor
-- **r6g.xlarge (4 vCPU, 32GB)**: Estimativa para instância maior
-- Proporção baseada em: throughput_local × (vCPUs_Aurora / vCPUs_local) × 0.8
+#### Teste: 50 ops/s concorrência
 
-#### Database State
-- **Dead tuples**: Tuplas mortas na tabela (normais após UPDATEs)
-- **Connections**: Conexões ativas no momento
-- **Pending locks**: Locks aguardando (0 = sem lock contention)
-- **Cache hit ratio**: Percentual de acerto de cache (>95% = bom)
-
-### Resultado dos Testes Realizados
-
-#### Teste 1: 5 ops/s concorrência
-
-```bash
-python3 scripts/simulate_load.py \
-    --existing-records 500000 \
-    --ingestion-size 1000000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5 \
-    --concurrent-ops 5
-```
-
-**Resultados:**
 | Métrica | Valor |
 |---------|-------|
-| Total Time | 297.87s (~5 min) |
-| Throughput | 3,021 regs/s |
+| Total Time | ~5 min |
+| Throughput | ~3,000 regs/s |
 | Errors | 0 |
-| P95 Latency | 81.0ms |
+| P95 Latency | ~60ms |
 | Pending Locks | 0 |
 
-**Estimativa Aurora r6g.xlarge:**
-- 1M registros → 12 min
-- 4M registros → 48 min
+#### Estimativa Aurora
 
-#### Teste 2: 50 ops/s concorrência
+| Instância | 1M registros | 4M registros |
+|-----------|-------------|--------------|
+| r6g.xlarge (4 vCPU, 32GB) | ~12 min | ~46 min |
 
-```bash
-python3 scripts/simulate_load.py \
-    --existing-records 500000 \
-    --ingestion-size 1000000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5 \
-    --concurrent-ops 50
-```
-
-**Resultados:**
-| Métrica | Valor |
-|---------|-------|
-| Total Time | 290.63s (~5 min) |
-| Throughput | 3,097 regs/s |
-| Errors | 0 |
-| P95 Latency | 59.9ms |
-| Pending Locks | 0 |
-| Cache Hit Ratio | 94.51% |
-
-**Estimativa Aurora r6g.xlarge:**
-- 1M registros → 12 min
-- 4M registros → 46 min
-
-### Interpretação dos Resultados
-
-**Impacto Baixo = Bom para Produção**
-- Errors = 0: Operações concorrentes não falharam
-- Pending Locks = 0: Não há lock contention
-- P95 Latency < 100ms: Tempo de resposta aceitável
-
-**Fatores que Afetam Throughput**
-1. Batch size maior = mais throughput (mas mais lock)
-2. Delay menor = mais throughput (mas mais impacto)
-3. Concorrência alta = pode reduzir throughput (lock contention)
-
-**Recomendação para 4kk em 30 minutos**
-- Aurora r6g.xlarge: ~46 min (acima do alvo)
-- Aurora r6g.2xlarge (8 vCPU): ~23 min (dentro do alvo)
-
-### Geração de Gráficos
-
-Para gerar gráficos a partir do CSV:
-
-```python
-import pandas as pd
-import matplotlib.pyplot as plt
-
-df = pd.read_csv('metrics_test.csv')
-
-# Gráfico de locks ao longo do tempo
-plt.figure(figsize=(12, 6))
-plt.plot(df['timestamp'], df['pending_locks'], label='Pending Locks')
-plt.xlabel('Tempo (s)')
-plt.ylabel('Locks')
-plt.title('Locks durante Merge')
-plt.legend()
-plt.grid(True)
-plt.savefig('locks_chart.png')
-
-# Gráfico de dead tuples
-plt.figure(figsize=(12, 6))
-plt.plot(df['timestamp'], df['dead_custody'], label='Dead Tuples (custody_position)')
-plt.plot(df['timestamp'], df['dead_buffer'], label='Dead Tuples (buffer)')
-plt.xlabel('Tempo (s)')
-plt.ylabel('Dead Tuples')
-plt.title('Acúmulo de Dead Tuples durante Merge')
-plt.legend()
-plt.grid(True)
-plt.savefig('dead_tuples_chart.png')
-```
-## Scripts Disponíveis
-
-| Script | Função |
-|--------|--------|
-| `scripts/seed_database.py` | Preenche tabela principal com dados base |
-| `scripts/simulate_load.py` | Executa simulação completa com métricas |
-
-### Uso Básico
+## Geração de Gráficos
 
 ```bash
-# Simular carga (já faz seed automático da tabela principal)
-python3 scripts/simulate_load.py \
-    --existing-records 100000 \
-    --ingestion-size 10000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5
+# Instalar dependências
+pip install matplotlib pandas
 
-# Ou seedar manualmente a tabela principal primeiro
-python3 scripts/seed_database.py --records 100000
+# Gerar gráficos
+python3 scripts/generate_charts.py metrics.csv --output ./charts
+
+# Abrir dashboard
+open charts/metrics_dashboard.png
 ```
 
-**Nota:** `simulate_load.py` sempre trunca e re-seda a tabela principal antes da simulação,
-garantindo estado limpo. `seed_database.py` também sempre trunca antes de inserir.
+## Merge Throttling (Controle de Impacto)
 
-### Parâmetros
+Para ambientes de produção com outras operações simultâneas, o merge pode ser configurado para reduzir impacto.
 
-| Parâmetro | Default | Descrição |
-|-----------|---------|-----------|
-| `--existing-records` | 100000 | Registros já existentes na tabela principal |
-| `--ingestion-size` | 10000 | Quantidade de registros para ingestação |
-| `--update-ratio` | 60 | % de registros que atualizarão dados existentes |
-| `--batch-size` | 2000 | Tamanho do batch de merge |
-| `--delay` | 0.5 | Delay entre batches (segundos) |
-| `--accounts` | 1000 | Quantidade de contas únicas para gerar |
+### Configuração
 
-### Exemplo de Saída
+| Variável | Default | Descrição |
+|----------|---------|-----------|
+| `MERGE_BATCH_SIZE` | 2000 | Quantidade de registros por batch |
+| `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches (segundos) |
 
-```
-============================================================
-=== LOAD SIMULATION REPORT ===
-Date: 2025-01-15 10:30:00
-Existing Records: 100,000
-Ingestion Size: 10,000 (60% updates, 40% inserts)
-Batch Size: 2,000
-Delay: 0.5s
+### Cálculo do Sweet Spot
 
-=== RESULTS ===
-Total Time: 45.234s
-Throughput: 221.1 records/second
-Batches: 5
-Per-batch breakdown:
-  - Batch 1: 1200 ins, 800 upd - 8.123s
-  - Batch 2: 800 ins, 1200 upd - 9.456s
-  - Batch 3: 1200 ins, 800 upd - 8.891s
-  - Batch 4: 800 ins, 1200 upd - 9.123s
-  - Batch 5: 400 ins, 600 upd - 9.641s
+| Batch Size | Delay | Impacto BD | Tempo (4M) |
+|------------|-------|------------|------------|
+| 500 | 1.0s | Mínimo | ~3.5h |
+| **2000** | **0.5s** | **Baixo** | **~1h** |
+| 5000 | 0.3s | Médio | ~30min |
 
-=== ESTIMATED PRODUCTION ===
-For 4,000,000 records: 5.0h
-============================================================
-```
+## Padrões de Resiliencia
 
-### Cenários de Teste Recomendados
+### Idempotência
+
+- Unique constraint em `(source_file, row_number)` garante que mesmo parquet processado 2x não duplica
+- Merge usa DELETE após sucesso, não marca status
+
+### Retry
+
+- Consumer ECS: retry automático via SQS visibility timeout
+- Merge: se falhar, registros permanecem na staging para próxima execução
+
+### Dead Letter Queue
+
+- Registros inválidos vão para `custody_position_error`
+- Payload JSONB preserva dados originais para investigação
+
+## Stack
+
+| Componente | Tecnologia |
+|------------|-----------|
+| Database | PostgreSQL 16 |
+| Object Storage | AWS S3 (LocalStack) |
+| Notifications | AWS SNS |
+| Compute | ECS Fargate (simulado localmente) |
+| Language | Python 3.12 |
+
+## Setup Local
 
 ```bash
-# Teste leve (rápido para validar funcionamento)
-python3 scripts/simulate_load.py \
-    --existing-records 10000 \
-    --ingestion-size 1000 \
-    --update-ratio 60
+# Subir serviços
+docker compose up -d
 
-# Teste médio (simula proporção real)
-python3 scripts/simulate_load.py \
-    --existing-records 100000 \
-    --ingestion-size 10000 \
-    --update-ratio 60 \
-    --batch-size 2000 \
-    --delay 0.5
+# Criar tabelas
+psql -h localhost -U pocuser -d pocdb -f sql/001_init.sql
 
-# Teste de performance (sem throttle)
-python3 scripts/simulate_load.py \
-    --existing-records 100000 \
-    --ingestion-size 100000 \
-    --update-ratio 60 \
-    --batch-size 10000 \
-    --delay 0
+# Setup infraestrutura (S3, SNS, SQS)
+python3 scripts/setup_infra.py
 
-# Teste com diferentes configurações
-for batch in 500 1000 2000 3000 5000; do
-    python scripts/simulate_load.py \
-        --existing-records 50000 \
-        --ingestion-size 5000 \
-        --update-ratio 60 \
-        --batch-size $batch \
-        --delay 0.5
-done
-```
+# Gerar e subir parquet
+python3 scripts/create_sample_file.py
+python3 scripts/upload_to_s3.py
 
-### Estimativa Proporcional
+# Simular notificação
+python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_position.parquet
 
-Para estimar tempo em produção (Aurora 36GB), use a proporção:
+# Processar parquet (ECS)
+python3 scripts/process_file.py --bucket poc-bucket --key input/custody_position.parquet
 
-```
-Tempo local (hardware X) = Tempo medido × (Recursos Aurora / Recursos Local)
-```
-
-Por exemplo, se local processou 10k registros em 45s:
-- Aurora tem ~4x mais CPU e IOPS que ambiente local
-- Estimativa: 45s / 4 = ~11s para 10k registros
-- Para 4kk: 4,000,000 / 10,000 × 11s = ~1.2h
-
-### Coleta de Métricas Adicionais (Opcional)
-
-Para coletar métricas do PostgreSQL durante a simulação, execute em outro terminal:
-
-```bash
-# Monitorar conexões e queries
-watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"'
-
-# Monitorar locks
-watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT * FROM pg_locks WHERE granted=false;"'
-
-# Monitorar tamanho das tabelas
-watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT relname, n_live_tup, n_dead_tup FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;"'
+# Merge para principal (Cron)
+python3 scripts/merge_staging.py
 ```
