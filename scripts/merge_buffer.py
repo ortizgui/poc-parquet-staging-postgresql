@@ -8,13 +8,15 @@ Uses a two-step approach per batch for production safety:
 Resilience:
   - Advisory lock (pg_advisory_lock) prevents concurrent merges
   - FOR UPDATE SKIP LOCKED for safe parallel processing
-  - Batches of 10,000 records
+  - Configurable batch size and delay between batches (throttling)
+  - Lock timeout to prevent long-running transactions
 
 Uso:
   python scripts/merge_buffer.py
 """
 
 import os
+import time
 
 import psycopg2
 from dotenv import load_dotenv
@@ -27,7 +29,8 @@ PG_DB = os.getenv("POSTGRES_DB", "pocdb")
 PG_USER = os.getenv("POSTGRES_USER", "pocuser")
 PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "pocpass")
 
-BATCH_SIZE = int(os.getenv("MERGE_BATCH_SIZE", "10000"))
+BATCH_SIZE = int(os.getenv("MERGE_BATCH_SIZE", "2000"))
+MERGE_DELAY_SECONDS = float(os.getenv("MERGE_DELAY_SECONDS", "0.5"))
 MERGE_LOCK_ID = 42
 
 
@@ -115,6 +118,10 @@ def main():
 
             conn.commit()
             total_merged += len(batch_ids)
+
+            # Throttle: pause between batches to reduce lock contention
+            if MERGE_DELAY_SECONDS > 0:
+                time.sleep(MERGE_DELAY_SECONDS)
 
             pct = (total_merged / pending_before) * 100
             batch_num = total_merged // BATCH_SIZE + (1 if total_merged % BATCH_SIZE else 0)
