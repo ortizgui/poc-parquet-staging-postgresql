@@ -96,7 +96,7 @@ def generate_insert_records(count, days_back=30):
         amount = round(random.uniform(100, 1000000), 2)
         row_number = len(records) + 1
         record_hash = uuid.uuid4().hex[:16]
-        records.append((batch_uuid, source_file, row_number, record_hash,
+        records.append((str(batch_uuid), source_file, row_number, record_hash,
                         account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
     
     return records
@@ -258,7 +258,7 @@ def main():
         quantity = round(random.uniform(10, 10000), 4)
         amount = round(random.uniform(100, 1000000), 2)
         record_hash = uuid.uuid4().hex[:16]
-        update_records.append((batch_uuid, source_file, i + 1, record_hash,
+        update_records.append((str(batch_uuid), source_file, i + 1, record_hash,
                               account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
 
     # Generate insert records (new combos)
