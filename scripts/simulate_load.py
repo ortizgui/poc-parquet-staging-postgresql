@@ -435,7 +435,7 @@ def main():
                         help="Simulate N concurrent operations per second during merge")
     parser.add_argument("--output-csv", type=str, default="",
                         help="Output CSV file for metrics")
-    args = parser.parse.parse_args()
+    args = parser.parse_args()
     
     conn_params = {
         'host': PG_HOST,
