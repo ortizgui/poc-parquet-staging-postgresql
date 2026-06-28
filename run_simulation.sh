@@ -22,6 +22,12 @@
 set -e
 
 # =============================================================================
+# Descobre o diretório do script e do projeto
+# =============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# =============================================================================
 # Configurações Padrão
 # =============================================================================
 EXISTING_RECORDS=500000
@@ -144,25 +150,14 @@ check_prerequisites() {
         exit 1
     fi
     
-    # psql é OPCIONAL - usaremos o do container Docker
-    if ! command -v psql &> /dev/null; then
-        warn "psql não encontrado localmente. Usaremos o psql do container Docker."
-    fi
-    
     success "Pré-requisitos OK"
 }
 
 # =============================================================================
-# Executa comando no PostgreSQL (via Docker ou local)
+# Executa comando no PostgreSQL (via Docker)
 # =============================================================================
 run_psql() {
-    if command -v psql &> /dev/null; then
-        # Usa psql local
-        psql "$@"
-    else
-        # Usa psql do container Docker
-        docker compose exec -T postgres psql -U pocuser -d pocdb "$@"
-    fi
+    docker compose exec -T postgres psql -U pocuser -d pocdb "$@"
 }
 
 # =============================================================================
@@ -248,7 +243,7 @@ setup_database() {
     
     # Recria as tabelas (sempre)
     log "Criando tabelas..."
-    run_psql -f sql/001_init.sql
+    run_psql -f /docker-entrypoint-initdb.d/001_init.sql
     
     success "Banco de dados pronto"
 }
@@ -268,8 +263,8 @@ run_simulation() {
     log "  Tamanho ingestão:     $INGESTION_SIZE"
     log "  % Updates:           $UPDATE_RATIO%"
     log "  Batch size:          $BATCH_SIZE"
-    log "  Delay entre batches:  ${DELAY}s"
-    log "  Output CSV:           $CSV_OUTPUT"
+    log "  Delay entre batches:   ${DELAY}s"
+    log "  Output CSV:          $CSV_OUTPUT"
     log ""
     log "=============================================="
     
