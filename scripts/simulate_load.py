@@ -34,7 +34,7 @@ ASSETS = ["PETR4", "VALE3", "ITUB4", "BBDC4", "ABEV3", "PERM4", "RENT3", "RADL3"
 # Aurora Graviton 6 specs for estimation
 AURORA_R6G_LARGE = {'vcpus': 2, 'ram_gb': 16, 'name': 'r6g.large'}
 AURORA_R6G_XLARGE = {'vcpus': 4, 'ram_gb': 32, 'name': 'r6g.xlarge'}
-LOCAL_SPECS = {'vcpus': 10, 'ram_gb': 32, 'name': 'Mac M4 Pro'}  # Approximate
+LOCAL_SPECS = {'vcpus': 10, 'ram_gb': 32, 'name': 'Mac M4 Pro'}
 
 
 class ConcurrentOperationsSimulator:
@@ -68,8 +68,6 @@ class ConcurrentOperationsSimulator:
                 
                 op_type = random.choice(['INSERT', 'UPDATE', 'SELECT'])
                 start_time = time.time()
-                success = True
-                error_msg = None
                 
                 if op_type == 'INSERT':
                     account = random.choice(ACCOUNTS)
@@ -186,15 +184,10 @@ def clear_buffer_table(cursor):
 
 def estimate_aurora_time(local_throughput, aurora_specs, local_specs=LOCAL_SPECS):
     """Estimate processing time on Aurora based on local performance."""
-    # Rough estimation based on CPU cores ratio
     cpu_ratio = aurora_specs['vcpus'] / local_specs['vcpus']
     ram_ratio = aurora_specs['ram_gb'] / local_specs['ram_gb']
-    
-    # Weighted average (CPU is more important for this workload)
     performance_ratio = (cpu_ratio * 0.7 + ram_ratio * 0.3)
-    
-    # Local is faster per core typically, so we adjust
-    estimated_throughput = local_throughput * performance_ratio * 0.8  # 0.8 = Mac M4 vs Graviton6 efficiency
+    estimated_throughput = local_throughput * performance_ratio * 0.8
     
     return {
         'aurora_specs': aurora_specs,
@@ -205,49 +198,29 @@ def estimate_aurora_time(local_throughput, aurora_specs, local_specs=LOCAL_SPECS
     }
 
 
-def collect_metrics():
-    """Collect comprehensive database metrics using separate connection."""
+def collect_metrics(metrics_conn):
+    """Collect metrics using provided connection (non-blocking, read-only)."""
     metrics = {}
     
-    conn_params = {
-        'host': PG_HOST,
-        'port': PG_PORT,
-        'dbname': PG_DB,
-        'user': PG_USER,
-        'password': PG_PASSWORD
-    }
+    if metrics_conn is None:
+        return metrics
     
     try:
-        conn = psycopg2.connect(**conn_params)
-        cur = conn.cursor()
+        cur = metrics_conn.cursor()
         
-        # Database size
-        cur.execute("SELECT pg_database_size(%s) / 1024 / 1024", (PG_DB,))
-        metrics['db_size_mb'] = cur.fetchone()[0]
-        
-        # Table stats
+        # Table stats using pg_stat_user_tables (compatible with all PostgreSQL versions)
         cur.execute("""
-            SELECT 
-                c.relname,
-                pg_stat_get_live_tup(c.oid) as live_tuples,
-                pg_stat_get_dead_tup(c.oid) as dead_tuples,
-                pg_size_pretty(pg_total_relation_size(c.oid)) as total_size
-            FROM pg_class c
-            WHERE c.relname IN ('custody_position', 'custody_position_buffer')
-            ORDER BY c.relname
+            SELECT schemaname, relname, n_live_tup, n_dead_tup, n_tup_ins, n_tup_upd, n_tup_del
+            FROM pg_stat_user_tables
+            WHERE relname IN ('custody_position', 'custody_position_buffer')
+            ORDER BY relname
         """)
         for row in cur.fetchall():
-            metrics[f'{row[0]}_live'] = row[1]
-            metrics[f'{row[0]}_dead'] = row[2]
-            metrics[f'{row[0]}_size'] = row[3]
+            metrics[f'{row[1]}_live'] = row[2] or 0
+            metrics[f'{row[1]}_dead'] = row[3] or 0
         
         # Connections
-        cur.execute("""
-            SELECT state, COUNT(*) 
-            FROM pg_stat_activity 
-            WHERE datname = %s
-            GROUP BY state
-        """, (PG_DB,))
+        cur.execute("SELECT state, COUNT(*) FROM pg_stat_activity WHERE datname = %s GROUP BY state", (PG_DB,))
         metrics['connections'] = dict(cur.fetchall())
         
         # Lock waiters
@@ -263,7 +236,7 @@ def collect_metrics():
         """)
         metrics['long_transactions'] = cur.fetchone()[0]
         
-        # Buffer cache hit ratio
+        # Cache hit ratio
         cur.execute("""
             SELECT 
                 CASE WHEN blks_hit + blks_read = 0 THEN 0
@@ -272,10 +245,10 @@ def collect_metrics():
             FROM pg_stat_database 
             WHERE datname = %s
         """, (PG_DB,))
-        metrics['cache_hit_ratio'] = cur.fetchone()[0]
+        result = cur.fetchone()
+        metrics['cache_hit_ratio'] = result[0] if result else None
         
         cur.close()
-        conn.close()
         
     except Exception as e:
         print(f"[WARN] Metrics collection error: {e}")
@@ -283,8 +256,8 @@ def collect_metrics():
     return metrics
 
 
-def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None):
-    """Run merge with detailed metrics collection."""
+def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None, metrics_conn=None):
+    """Run merge with periodic metrics collection (not every batch)."""
     start_time = time.time()
     
     cursor.execute("SELECT pg_advisory_lock(%s)", (MERGE_LOCK_ID,))
@@ -300,13 +273,12 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None):
     total_merged = 0
     batch_results = []
     metrics_history = []
+    last_metrics_time = 0
+    metrics_interval = 2.0  # Collect metrics every 2 seconds, not every batch
     
     while True:
         batch_start = time.time()
         batch_num = total_merged // batch_size + 1
-        
-        # Collect pre-batch metrics
-        pre_metrics = collect_metrics()
         
         cursor.execute("""
             SELECT id
@@ -363,43 +335,39 @@ def run_merge_with_metrics(cursor, conn, batch_size, delay, csv_writer=None):
         batch_time = time.time() - batch_start
         total_merged += len(batch_ids)
         
-        # Collect post-batch metrics
-        post_metrics = collect_metrics()
-        post_metrics['timestamp'] = time.time() - start_time
-        post_metrics['batch'] = batch_num
-        post_metrics['batch_time'] = batch_time
-        post_metrics['inserted'] = inserted
-        post_metrics['updated'] = updated
-        post_metrics['total_processed'] = total_merged
-        
-        metrics_history.append(post_metrics)
-        
-        # Write to CSV if provided
-        if csv_writer:
-            csv_writer.writerow({
-                'timestamp': post_metrics['timestamp'],
-                'batch': batch_num,
-                'batch_time_ms': batch_time * 1000,
-                'inserted': inserted,
-                'updated': updated,
-                'total_processed': total_merged,
-                'pending_locks': post_metrics.get('pending_locks', 0),
-                'dead_custody': post_metrics.get('custody_position_dead', 0),
-                'dead_buffer': post_metrics.get('custody_position_buffer_dead', 0),
-                'cache_hit_ratio': post_metrics.get('cache_hit_ratio', 0),
-                'long_transactions': post_metrics.get('long_transactions', 0)
-            })
+        # Collect metrics periodically, not every batch
+        current_time = time.time() - start_time
+        if current_time - last_metrics_time >= metrics_interval:
+            post_metrics = collect_metrics(metrics_conn)
+            post_metrics['timestamp'] = current_time
+            post_metrics['batch'] = batch_num
+            post_metrics['batch_time'] = batch_time
+            post_metrics['inserted'] = inserted
+            post_metrics['updated'] = updated
+            post_metrics['total_processed'] = total_merged
+            metrics_history.append(post_metrics)
+            last_metrics_time = current_time
+            
+            if csv_writer:
+                csv_writer.writerow({
+                    'timestamp': post_metrics['timestamp'],
+                    'batch': batch_num,
+                    'batch_time_ms': batch_time * 1000,
+                    'inserted': inserted,
+                    'updated': updated,
+                    'total_processed': total_merged,
+                    'pending_locks': post_metrics.get('pending_locks', 0),
+                    'dead_custody': post_metrics.get('custody_position_dead', 0),
+                    'dead_buffer': post_metrics.get('custody_position_buffer_dead', 0),
+                    'cache_hit_ratio': post_metrics.get('cache_hit_ratio', 0),
+                    'long_transactions': post_metrics.get('long_transactions', 0)
+                })
         
         pct = (total_merged / pending_before) * 100
         total_batches = (pending_before + batch_size - 1) // batch_size
         
         print(f"  [BATCH {batch_num}/{total_batches}] +{inserted}ins ~{updated}upd | "
-              f"time={batch_time*1000:.0f}ms | "
-              f"locks={post_metrics.get('pending_locks', 0)} | "
-              f"dead_cp={post_metrics.get('custody_position_dead', 0)} | "
-              f"dead_buf={post_metrics.get('custody_position_buffer_dead', 0)} | "
-              f"cache={post_metrics.get('cache_hit_ratio', 'N/A')}% | "
-              f"{pct:.0f}%")
+              f"time={batch_time*1000:.0f}ms | {pct:.0f}%")
         
         if delay > 0:
             time.sleep(delay)
@@ -443,6 +411,9 @@ def main():
     
     conn = psycopg2.connect(**conn_params)
     cursor = conn.cursor()
+    
+    # Create a separate connection for metrics (reused, not per-call)
+    metrics_conn = psycopg2.connect(**conn_params)
     
     seed_principal_table(cursor, args.existing_records)
     clear_buffer_table(cursor)
@@ -540,15 +511,15 @@ def main():
     if args.concurrent_ops > 0:
         concurrent_sim = ConcurrentOperationsSimulator(
             ops_per_second=args.concurrent_ops,
-            duration_seconds=300  # 5 minutes max
+            duration_seconds=300
         )
         concurrent_sim.start(conn_params)
         print(f"[CONCURRENT] Simulating {args.concurrent_ops} ops/sec during merge")
     
-    # Run merge with metrics
+    # Run merge with metrics (pass metrics_conn to be reused)
     print(f"\n[MERGE] Starting merge...")
     total_merged, batch_results, total_time, metrics_history = run_merge_with_metrics(
-        cursor, conn, args.batch_size, args.delay, csv_writer
+        cursor, conn, args.batch_size, args.delay, csv_writer, metrics_conn
     )
     
     # Stop concurrent simulator
@@ -559,6 +530,9 @@ def main():
     
     if csv_file:
         csv_file.close()
+    
+    # Collect final metrics
+    final_metrics = collect_metrics(metrics_conn)
     
     throughput = total_merged / total_time if total_time > 0 else 0
     
@@ -600,13 +574,9 @@ def main():
     print()
     
     print("=== FINAL DATABASE STATE ===")
-    final_metrics = collect_metrics()
-    print(f"DB Size: {final_metrics.get('db_size_mb', 'N/A')}MB")
-    print(f"Table sizes:")
-    print(f"  - custody_position: {final_metrics.get('custody_position_size', 'N/A')} "
-          f"(dead: {final_metrics.get('custody_position_dead', 'N/A')})")
-    print(f"  - custody_position_buffer: {final_metrics.get('custody_position_buffer_size', 'N/A')} "
-          f"(dead: {final_metrics.get('custody_position_buffer_dead', 'N/A')})")
+    print(f"Dead tuples:")
+    print(f"  - custody_position: {final_metrics.get('custody_position_dead', 'N/A')}")
+    print(f"  - custody_position_buffer: {final_metrics.get('custody_position_buffer_dead', 'N/A')}")
     print(f"Connections: {final_metrics.get('connections', {})}")
     print(f"Pending locks: {final_metrics.get('pending_locks', 'N/A')}")
     print(f"Cache hit ratio: {final_metrics.get('cache_hit_ratio', 'N/A')}%")
@@ -614,12 +584,11 @@ def main():
     
     if args.output_csv:
         print(f"\n[CSV] Metrics saved to {args.output_csv}")
-        print("[CSV] To generate chart, use:")
-        print(f"  python3 -c \"import pandas as pd; df=pd.read_csv('{args.output_csv}'); "
-              "df.plot(x='timestamp', y=['pending_locks', 'dead_custody'])\"")
     
+    # Cleanup
     cursor.close()
     conn.close()
+    metrics_conn.close()
 
 
 if __name__ == "__main__":
