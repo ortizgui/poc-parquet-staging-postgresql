@@ -3,21 +3,20 @@
 # Load Simulation Runner
 # 
 # Executa a simulação completa de carga:
-# 1. Setup do ambiente (Docker, PostgreSQL)
+# 1. Setup do ambiente (Docker, PostgreSQL) - SEMPRE com clean
 # 2. Criação das tabelas
 # 3. Seed da base com dados existentes
 # 4. Simulação de carga
 # 5. Geração de relatório
 #
 # Uso:
-#   ./run_simulation.sh                    # Usa parâmetros padrão
-#   ./run_simulation.sh --clean            # Limpa e recria tudo
-#   ./run_simulation.sh --no-docker        # Apenas executa scripts (sem subir docker)
-#   ./run_simulation.sh --existing 100000   # Quantidade de registros existentes
-#   ./run_simulation.sh --ingestion 500000  # Quantidade para ingestão
+#   ./run_simulation.sh                    # Padrão (clean + execução)
+#   ./run_simulation.sh --keep-docker      # Não recria Docker (mais rápido)
+#   ./run_simulation.sh --existing 100000  # Quantidade de registros existentes
+#   ./run_simulation.sh --ingestion 500000 # Quantidade para ingestão
 #   ./run_simulation.sh --batch 2000       # Batch size
-#   ./run_simulation.sh --delay 0.5        # Delay entre batches
-#   ./run_simulation.sh --report-only       # Apenas gera relatório do último CSV
+#   ./run_simulation.sh --delay 0.5       # Delay entre batches
+#   ./run_simulation.sh --report-only     # Apenas gera relatório do último CSV
 # =============================================================================
 
 set -e
@@ -30,8 +29,7 @@ INGESTION_SIZE=1000000
 UPDATE_RATIO=60
 BATCH_SIZE=2000
 DELAY=0.5
-CLEAN_MODE=false
-SKIP_DOCKER=false
+KEEP_DOCKER=false
 REPORT_ONLY=false
 CSV_OUTPUT="metrics_$(date +%Y%m%d_%H%M%S).csv"
 
@@ -66,12 +64,8 @@ error() {
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --clean)
-                CLEAN_MODE=true
-                shift
-                ;;
-            --no-docker)
-                SKIP_DOCKER=true
+            --keep-docker)
+                KEEP_DOCKER=true
                 shift
                 ;;
             --report-only)
@@ -103,14 +97,13 @@ parse_args() {
                 echo ""
                 echo "Opções:"
                 echo "  --existing NUM    Registros existentes na base (default: $EXISTING_RECORDS)"
-                echo "  --ingestion NUM   Quantidade para ingestão (default: $INGESTION_SIZE)"
-                echo "  --batch NUM       Batch size (default: $BATCH_SIZE)"
-                echo "  --delay NUM       Delay entre batches em segundos (default: $DELAY)"
-                echo "  --output FILE     Nome do arquivo CSV de saída"
-                echo "  --clean           Limpa e recria o ambiente"
-                echo "  --no-docker       Não sobe o docker (apenas executa scripts)"
-                echo "  --report-only     Apenas gera relatório do último CSV"
-                echo "  --help, -h        Mostra esta ajuda"
+                echo "  --ingestion NUM  Quantidade para ingestão (default: $INGESTION_SIZE)"
+                echo "  --batch NUM      Batch size (default: $BATCH_SIZE)"
+                echo "  --delay NUM      Delay entre batches em segundos (default: $DELAY)"
+                echo "  --output FILE    Nome do arquivo CSV de saída"
+                echo "  --keep-docker    Não recria Docker (mais rápido, reuse containers)"
+                echo "  --report-only    Apenas gera relatório do último CSV"
+                echo "  --help, -h      Mostra esta ajuda"
                 exit 0
                 ;;
             *)
@@ -130,6 +123,12 @@ check_prerequisites() {
     # Verifica Docker
     if ! command -v docker &> /dev/null; then
         error "Docker não encontrado. Instale o Docker primeiro."
+        exit 1
+    fi
+    
+    # Verifica Docker Compose
+    if ! docker compose version &> /dev/null; then
+        error "docker compose não encontrado."
         exit 1
     fi
     
@@ -155,25 +154,34 @@ check_prerequisites() {
 }
 
 # =============================================================================
-# Setup do Ambiente Docker
+# Setup do Ambiente Docker (SEMPRE faz clean)
 # =============================================================================
 setup_docker() {
-    if [ "$SKIP_DOCKER" = true ]; then
-        warn "Pulando setup do Docker (--no-docker)"
-        return
+    if [ "$KEEP_DOCKER" = true ]; then
+        warn "Pulando setup do Docker (--keep-docker)"
+        
+        # Verifica se está rodando
+        if ! docker compose ps &>/dev/null; then
+            warn "Docker não está rodando, iniciando..."
+            KEEP_DOCKER=false
+        else
+            log "Reusando containers existentes"
+            return
+        fi
     fi
     
-    log "Setup do ambiente Docker..."
+    log "=============================================="
+    log "  LIMPEZA DO AMBIENTE (sempre é clean start)"
+    log "=============================================="
     
-    # Para e remove containers existentes se --clean
-    if [ "$CLEAN_MODE" = true ]; then
-        log "Parando containers existentes..."
-        docker compose down -v 2>/dev/null || true
-        docker compose rm -f 2>/dev/null || true
-        success "Containers anteriores removidos"
-    fi
+    # Para e remove containers existentes
+    log "Parando containers existentes..."
+    docker compose down -v 2>/dev/null || true
+    docker compose rm -f 2>/dev/null || true
     
-    # Sobe os serviços
+    success "Ambiente limpo!"
+    
+    # Sobe os serviços frescos
     log "Subindo serviços (docker compose up -d)..."
     docker compose up -d
     
@@ -221,17 +229,12 @@ setup_python() {
 # Setup do Banco de Dados
 # =============================================================================
 setup_database() {
-    if [ "$SKIP_DOCKER" = true ]; then
-        warn "Pulando setup do banco (--no-docker)"
-        return
-    fi
-    
     log "Setup do banco de dados..."
     
     # Aguarda um pouco para o PostgreSQL estar totalmente pronto
     sleep 2
     
-    # Executa script de criação das tabelas
+    # Recria as tabelas (sempre)
     log "Criando tabelas..."
     docker compose exec -T postgres psql -U pocuser -d pocdb -f /docker-entrypoint-initdb.d/001_init.sql
     
@@ -244,16 +247,17 @@ setup_database() {
 run_simulation() {
     source .venv/bin/activate
     
+    log ""
     log "=============================================="
     log "  INICIANDO SIMULAÇÃO DE CARGA"
     log "=============================================="
     log ""
     log "  Registros existentes: $EXISTING_RECORDS"
     log "  Tamanho ingestão:     $INGESTION_SIZE"
-    log "  % Updates:            $UPDATE_RATIO%"
-    log "  Batch size:           $BATCH_SIZE"
-    log "  Delay entre batches:   ${DELAY}s"
-    log "  Output CSV:            $CSV_OUTPUT"
+    log "  % Updates:           $UPDATE_RATIO%"
+    log "  Batch size:          $BATCH_SIZE"
+    log "  Delay entre batches:  ${DELAY}s"
+    log "  Output CSV:          $CSV_OUTPUT"
     log ""
     log "=============================================="
     
@@ -299,26 +303,13 @@ generate_report() {
 }
 
 # =============================================================================
-# Cleanup
-# =============================================================================
-cleanup() {
-    log "Limpando..."
-    
-    # Desativa virtualenv
-    if [ -n "$VIRTUAL_ENV" ]; then
-        deactivate 2>/dev/null || true
-    fi
-    
-    success "Cleanup concluído"
-}
-
-# =============================================================================
 # Main
 # =============================================================================
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║         LOAD SIMULATION RUNNER                            ║"
+    echo "║         LOAD SIMULATION RUNNER                         ║"
+    echo "║         (clean start - sempre recria o ambiente)       ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
     
@@ -338,12 +329,9 @@ main() {
     
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║         SIMULAÇÃO CONCLUÍDA COM SUCESSO!                 ║"
+    echo "║         SIMULAÇÃO CONCLUÍDA COM SUCESSO!                ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
 }
-
-# Trap para cleanup em caso de erro
-trap cleanup EXIT
 
 main "$@"
