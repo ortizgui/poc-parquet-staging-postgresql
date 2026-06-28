@@ -37,7 +37,10 @@ BATCH_SIZE=2000
 DELAY=0.5
 KEEP_DOCKER=false
 REPORT_ONLY=false
-CSV_OUTPUT="metrics_$(date +%Y%m%d_%H%M%S).csv"
+CSV_OUTPUT="reports/metrics_$(date +%Y%m%d_%H%M%S).csv"
+
+# Cria diretório de reports se não existir
+mkdir -p reports
 
 # =============================================================================
 # Cores para output
@@ -95,7 +98,7 @@ parse_args() {
                 shift 2
                 ;;
             --output)
-                CSV_OUTPUT="$2"
+                CSV_OUTPUT="reports/$2"
                 shift 2
                 ;;
             --help|-h)
@@ -106,7 +109,7 @@ parse_args() {
                 echo "  --ingestion NUM  Quantidade para ingestão (default: $INGESTION_SIZE)"
                 echo "  --batch NUM      Batch size (default: $BATCH_SIZE)"
                 echo "  --delay NUM      Delay entre batches em segundos (default: $DELAY)"
-                echo "  --output FILE    Nome do arquivo CSV de saída"
+                echo "  --output FILE    Nome do arquivo CSV de saída (default: reports/metrics_TIMESTAMP.csv)"
                 echo "  --keep-docker   Não recria Docker (mais rápido, reuse containers)"
                 echo "  --report-only   Apenas gera relatório do último CSV"
                 echo "  --help, -h      Mostra esta ajuda"
@@ -263,7 +266,7 @@ run_simulation() {
     log "  Tamanho ingestão:     $INGESTION_SIZE"
     log "  % Updates:           $UPDATE_RATIO%"
     log "  Batch size:          $BATCH_SIZE"
-    log "  Delay entre batches:   ${DELAY}s"
+    log "  Delay entre batches:  ${DELAY}s"
     log "  Output CSV:          $CSV_OUTPUT"
     log ""
     log "=============================================="
@@ -288,7 +291,7 @@ generate_report() {
     
     # Encontra o último CSV se não especificou
     if [ -z "$CSV_OUTPUT" ] || [ ! -f "$CSV_OUTPUT" ]; then
-        CSV_OUTPUT=$(ls -t metrics_*.csv 2>/dev/null | head -1)
+        CSV_OUTPUT=$(ls -t reports/metrics_*.csv 2>/dev/null | head -1)
         if [ -z "$CSV_OUTPUT" ]; then
             warn "Nenhum arquivo CSV encontrado para gerar relatório"
             return
