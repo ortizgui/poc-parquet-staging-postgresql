@@ -263,3 +263,131 @@ MERGE_DELAY_SECONDS=0.5
 MERGE_BATCH_SIZE=10000
 MERGE_DELAY_SECONDS=0
 ```
+
+## Load Simulation Tool
+
+Ferramenta para simular carga de produção e validar configurações de merge antes de deploy.
+
+### Scripts Disponíveis
+
+| Script | Função |
+|--------|--------|
+| `scripts/seed_database.py` | Preenche tabela principal com dados base |
+| `scripts/simulate_load.py` | Executa simulação completa com métricas |
+
+### Uso Básico
+
+```bash
+# 1. Preencher tabela principal com dados existentes
+python scripts/seed_database.py --records 100000
+
+# 2. Executar simulação de carga
+python scripts/simulate_load.py \
+    --existing-records 100000 \
+    --ingestion-size 10000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5
+```
+
+### Parâmetros
+
+| Parâmetro | Default | Descrição |
+|-----------|---------|-----------|
+| `--existing-records` | 100000 | Registros já existentes na tabela principal |
+| `--ingestion-size` | 10000 | Quantidade de registros para ingestação |
+| `--update-ratio` | 60 | % de registros que atualizarão dados existentes |
+| `--batch-size` | 2000 | Tamanho do batch de merge |
+| `--delay` | 0.5 | Delay entre batches (segundos) |
+| `--accounts` | 1000 | Quantidade de contas únicas para gerar |
+
+### Exemplo de Saída
+
+```
+============================================================
+=== LOAD SIMULATION REPORT ===
+Date: 2025-01-15 10:30:00
+Existing Records: 100,000
+Ingestion Size: 10,000 (60% updates, 40% inserts)
+Batch Size: 2,000
+Delay: 0.5s
+
+=== RESULTS ===
+Total Time: 45.234s
+Throughput: 221.1 records/second
+Batches: 5
+Per-batch breakdown:
+  - Batch 1: 1200 ins, 800 upd - 8.123s
+  - Batch 2: 800 ins, 1200 upd - 9.456s
+  - Batch 3: 1200 ins, 800 upd - 8.891s
+  - Batch 4: 800 ins, 1200 upd - 9.123s
+  - Batch 5: 400 ins, 600 upd - 9.641s
+
+=== ESTIMATED PRODUCTION ===
+For 4,000,000 records: 5.0h
+============================================================
+```
+
+### Cenários de Teste Recomendados
+
+```bash
+# Teste leve (rápido para validar funcionamento)
+python scripts/simulate_load.py \
+    --existing-records 10000 \
+    --ingestion-size 1000 \
+    --update-ratio 60
+
+# Teste médio (simula proporção real)
+python scripts/simulate_load.py \
+    --existing-records 100000 \
+    --ingestion-size 10000 \
+    --update-ratio 60 \
+    --batch-size 2000 \
+    --delay 0.5
+
+# Teste de performance (sem throttle)
+python scripts/simulate_load.py \
+    --existing-records 100000 \
+    --ingestion-size 100000 \
+    --update-ratio 60 \
+    --batch-size 10000 \
+    --delay 0
+
+# Teste com diferentes configurações
+for batch in 500 1000 2000 3000 5000; do
+    python scripts/simulate_load.py \
+        --existing-records 50000 \
+        --ingestion-size 5000 \
+        --update-ratio 60 \
+        --batch-size $batch \
+        --delay 0.5
+done
+```
+
+### Estimativa Proporcional
+
+Para estimar tempo em produção (Aurora 36GB), use a proporção:
+
+```
+Tempo local (hardware X) = Tempo medido × (Recursos Aurora / Recursos Local)
+```
+
+Por exemplo, se local processou 10k registros em 45s:
+- Aurora tem ~4x mais CPU e IOPS que ambiente local
+- Estimativa: 45s / 4 = ~11s para 10k registros
+- Para 4kk: 4,000,000 / 10,000 × 11s = ~1.2h
+
+### Coleta de Métricas Adicionais (Opcional)
+
+Para coletar métricas do PostgreSQL durante a simulação, execute em outro terminal:
+
+```bash
+# Monitorar conexões e queries
+watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"'
+
+# Monitorar locks
+watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT * FROM pg_locks WHERE granted=false;"'
+
+# Monitorar tamanho das tabelas
+watch -n 1 'psql -h localhost -U pocuser -d pocdb -c "SELECT relname, n_live_tup, n_dead_tup FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;"'
+```
