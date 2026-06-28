@@ -1,7 +1,7 @@
 """Seed custody_position table with realistic test data.
 
 Usage:
-    python scripts/seed_database.py --records 100000
+    python3 scripts/seed_database.py --records 100000
 """
 
 import argparse
@@ -30,19 +30,11 @@ def generate_unique_records(count, days_back=30):
     """Generate records with unique (account_id, asset_id, reference_date) combos."""
     records = []
     base_date = datetime.now().date()
-    
-    # Calculate how many unique combos we can generate
-    # 10000 accounts × 20 assets × 31 days = 6,200,000 possible combos
-    # For 100k records this should work without issues
-    
     dates = [base_date - timedelta(days=i) for i in range(days_back + 1)]
     
-    # Generate all possible combos (but don't store all in memory)
-    # We'll use a set to track what we've generated
     seen = set()
-    
     attempts = 0
-    max_attempts = count * 2  # Allow some retries
+    max_attempts = count * 3  # Allow more attempts to find unique combos
     
     while len(records) < count and attempts < max_attempts:
         attempts += 1
@@ -79,7 +71,8 @@ def main():
     )
     cur = conn.cursor()
 
-    print(f"[SEED] Clearing custody_position table...")
+    # Always truncate to ensure clean state
+    print(f"[SEED] Truncating custody_position table...")
     cur.execute("TRUNCATE TABLE custody_position CASCADE")
     conn.commit()
 

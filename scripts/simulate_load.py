@@ -1,7 +1,7 @@
 """Load simulation tool for the POC.
 
 Usage:
-    python scripts/simulate_load.py --existing-records 100000 --ingestion-size 10000 --update-ratio 60
+    python3 scripts/simulate_load.py --existing-records 100000 --ingestion-size 10000 --update-ratio 60
 """
 
 import argparse
@@ -29,17 +29,7 @@ ASSETS = ["PETR4", "VALE3", "ITUB4", "BBDC4", "ABEV3", "PERM4", "RENT3", "RADL3"
           "CCRO3", "EMBR3", "GGBR4", "CSNA3", "USIM5", "GOAU4", "BRAP4", "VALE5", "FIBR3", "CPFE3"]
 
 
-def generate_existing_combos(cursor, count):
-    cursor.execute("""
-        SELECT account_id, asset_id, reference_date
-        FROM custody_position
-        ORDER BY random()
-        LIMIT %s
-    """, (count,))
-    return cursor.fetchall()
-
-
-def generate_unique_records_for_seed(count, days_back=30):
+def generate_unique_records(count, days_back=30):
     """Generate records with unique (account_id, asset_id, reference_date) combos."""
     records = []
     base_date = datetime.now().date()
@@ -47,7 +37,7 @@ def generate_unique_records_for_seed(count, days_back=30):
     
     seen = set()
     attempts = 0
-    max_attempts = count * 2
+    max_attempts = count * 3
     
     while len(records) < count and attempts < max_attempts:
         attempts += 1
@@ -70,50 +60,13 @@ def generate_unique_records_for_seed(count, days_back=30):
     return records
 
 
-def generate_insert_records(count, days_back=30):
-    """Generate new records for insert that won't conflict with existing data."""
-    records = []
-    base_date = datetime.now().date()
-    source_file = f"sim_{uuid.uuid4().hex[:8]}.parquet"
-    batch_uuid = uuid.uuid4()
-    
-    seen = set()
-    attempts = 0
-    max_attempts = count * 2
-    
-    while len(records) < count and attempts < max_attempts:
-        attempts += 1
-        account_id = random.choice(ACCOUNTS)
-        asset_id = random.choice(ASSETS)
-        reference_date = base_date - timedelta(days=random.randint(0, days_back))
-        
-        key = (account_id, asset_id, reference_date)
-        if key in seen:
-            continue
-            
-        seen.add(key)
-        quantity = round(random.uniform(10, 10000), 4)
-        amount = round(random.uniform(100, 1000000), 2)
-        row_number = len(records) + 1
-        record_hash = uuid.uuid4().hex[:16]
-        records.append((str(batch_uuid), source_file, row_number, record_hash,
-                        account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
-    
-    return records
-
-
 def seed_principal_table(cursor, count):
-    cursor.execute("SELECT COUNT(*) FROM custody_position")
-    existing = cursor.fetchone()[0]
-    if existing >= count:
-        print(f"[SEED] Principal table already has {existing} records (need {count})")
-        return
-
-    print(f"[SEED] Seeding principal table with {count} records...")
+    """Seed principal table, always truncating first for clean state."""
+    print(f"[SEED] Truncating and seeding principal table with {count} records...")
     cursor.execute("TRUNCATE TABLE custody_position CASCADE")
-
-    records = generate_unique_records_for_seed(count)
-
+    
+    records = generate_unique_records(count)
+    
     execute_values(
         cursor,
         """INSERT INTO custody_position (account_id, asset_id, reference_date, quantity, amount)
@@ -226,8 +179,6 @@ def main():
                         help="Merge batch size")
     parser.add_argument("--delay", type=float, default=0.5,
                         help="Delay between batches (seconds)")
-    parser.add_argument("--accounts", type=int, default=1000,
-                        help="Unique accounts to generate")
     args = parser.parse_args()
 
     conn = psycopg2.connect(
@@ -239,35 +190,84 @@ def main():
     )
     cursor = conn.cursor()
 
+    # Always seed fresh to ensure clean state
     seed_principal_table(cursor, args.existing_records)
     clear_buffer_table(cursor)
 
-    print(f"[GEN] Generating {args.ingestion_size} records ({args.update_ratio}% updates)...")
     update_count = int(args.ingestion_size * args.update_ratio / 100)
     insert_count = args.ingestion_size - update_count
 
+    print(f"[GEN] Generating {args.ingestion_size} records ({args.update_ratio}% updates = {update_count}, {100-args.update_ratio}% inserts = {insert_count})...")
+
     # Get existing combos for updates
-    existing_combos = generate_existing_combos(cursor, update_count)
+    cursor.execute("""
+        SELECT account_id, asset_id, reference_date
+        FROM custody_position
+        ORDER BY random()
+        LIMIT %s
+    """, (update_count,))
+    existing_combos = set((row[0], row[1], row[2]) for row in cursor.fetchall())
     
-    # Generate update records (using existing combos)
+    print(f"[GEN] Found {len(existing_combos)} existing combos for updates")
+
+    # Get all existing combos to avoid for inserts
+    cursor.execute("SELECT account_id, asset_id, reference_date FROM custody_position")
+    all_existing_combos = set((row[0], row[1], row[2]) for row in cursor.fetchall())
+    
+    # Also track what we're going to insert to avoid internal duplicates
+    planned_insert_combos = set()
+    
+    base_date = datetime.now().date()
+    dates = [base_date - timedelta(days=i) for i in range(31)]
+    
+    # Generate update records (using existing combos - these will definitely update)
     source_file = f"sim_{uuid.uuid4().hex[:8]}.parquet"
-    batch_uuid = uuid.uuid4()
+    batch_uuid = str(uuid.uuid4())
     update_records = []
+    
     for i, combo in enumerate(existing_combos):
         account_id, asset_id, reference_date = combo
         quantity = round(random.uniform(10, 10000), 4)
         amount = round(random.uniform(100, 1000000), 2)
         record_hash = uuid.uuid4().hex[:16]
-        update_records.append((str(batch_uuid), source_file, i + 1, record_hash,
-                              account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
+        update_records.append((batch_uuid, source_file, i + 1, record_hash,
+                            account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
 
-    # Generate insert records (new combos)
-    insert_records = generate_insert_records(insert_count)
+    # Generate insert records (NEW combos that don't exist in principal table)
+    insert_records = []
+    attempts = 0
+    max_attempts = insert_count * 10
+    
+    while len(insert_records) < insert_count and attempts < max_attempts:
+        attempts += 1
+        account_id = random.choice(ACCOUNTS)
+        asset_id = random.choice(ASSETS)
+        reference_date = random.choice(dates)
+        
+        key = (account_id, asset_id, reference_date)
+        
+        # Must not exist in principal table AND not be a duplicate within our inserts
+        if key in all_existing_combos or key in planned_insert_combos:
+            continue
+        
+        planned_insert_combos.add(key)
+        quantity = round(random.uniform(10, 10000), 4)
+        amount = round(random.uniform(100, 1000000), 2)
+        row_number = len(insert_records) + 1
+        record_hash = uuid.uuid4().hex[:16]
+        insert_records.append((batch_uuid, source_file, row_number, record_hash,
+                             account_id, asset_id, reference_date, quantity, amount, 'PENDING'))
 
+    if len(insert_records) < insert_count:
+        print(f"[WARN] Only generated {len(insert_records)} unique insert records (needed {insert_count})")
+
+    # Combine and shuffle
     all_records = update_records + insert_records
     random.shuffle(all_records)
 
-    print(f"[GEN] Inserting {len(all_records)} records into buffer table...")
+    print(f"[GEN] Prepared {len(update_records)} update + {len(insert_records)} insert = {len(all_records)} total records")
+    print(f"[GEN] Inserting into buffer table...")
+
     execute_values(
         cursor,
         """INSERT INTO custody_position_buffer
