@@ -213,3 +213,53 @@ merge_buffer.py:
 | Schema mudou | Coluna nova no Parquet | Erro no consume_s3_event | Validar schema antes de ler |
 | Merge concorrente | 2+ instancias do merge_buffer.py | Segunda espera advisory lock | Libera quando primeira termina |
 | Merge trava com lock | Script morre sem unlock | Advisory lock fica preso | pg_advisory_unlock(42) ou reinicio da sessao |
+
+## Merge Throttling (Controle de Impacto)
+
+Para ambientes de produção com outras operações simultâneas, o merge pode ser configurado para reduzir impacto no BD.
+
+### Configuração
+
+| Variável | Default | Descrição |
+|----------|---------|-----------|
+| `MERGE_BATCH_SIZE` | 2000 | Quantidade de registros por batch |
+| `MERGE_DELAY_SECONDS` | 0.5 | Pausa entre batches (segundos) |
+
+### Cálculo do Sweet Spot
+
+O objetivo é encontrar um ponto de equilíbrio entre tempo de processamento e impacto no BD:
+
+| Batch Size | Batches (4kk) | Delay | Tempo Total | Impacto BD |
+|------------|---------------|-------|-------------|------------|
+| 500 | 8.000 | 1.0s | ~3,5h | Mínimo |
+| **2000** | **2.000** | **0.5s** | **~1h** | **Baixo** |
+| 3000 | 1.333 | 0.3s | ~45min | Médio |
+| 5000 | 800 | 0.3s | ~30min | Médio |
+| 10000 | 400 | 0s | ~15min | Alto |
+
+### Tempos Estimados por Tamanho de Pico
+
+| Pico | BATCH=2000, DELAY=0.5s | BATCH=3000, DELAY=0.3s |
+|------|------------------------|------------------------|
+| 1kk | ~17 min | ~12 min |
+| 3kk | ~50 min | ~35 min |
+| 4kk | ~1h08min | ~45 min |
+
+### Recomendação
+
+Para ambientes Aurora com 36GB RAM e operações simultâneas:
+- **BATCH_SIZE=2000** com **DELAY=0.5s** é o sweet spot recomendado
+- Permite que outras operações passem entre batches
+- Tempo de processamento aceitável para picos de até 4kk
+
+### Configuração no .env
+
+```bash
+# Para ambiente de produção (menor impacto)
+MERGE_BATCH_SIZE=2000
+MERGE_DELAY_SECONDS=0.5
+
+# Para teste de velocidade (sem throttle)
+MERGE_BATCH_SIZE=10000
+MERGE_DELAY_SECONDS=0
+```
