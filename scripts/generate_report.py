@@ -698,7 +698,15 @@ def generate_report(csv_file, output_file=None):
                     borderColor: '#00D9FF',
                     borderWidth: 1,
                     padding: 12,
-                    cornerRadius: 8
+                    cornerRadius: 8,
+                    callbacks: {{
+                        label: function(context) {{
+                            let value = context.parsed.y;
+                            if (value === null) return '';
+                            value = value.toFixed(2).replace('.', ',').replace(/\B(?=(\d{{3}})+(?!\d))/g, '.');
+                            return context.dataset.label + ': ' + value;
+                        }}
+                    }}
                 }}
             }}
         }};
