@@ -703,7 +703,11 @@ def generate_report(csv_file, output_file=None):
                         label: function(context) {{
                             let value = context.parsed.y;
                             if (value === null) return '';
-                            value = value.toFixed(2).replace('.', ',').replace(/\B(?=(\d{{3}})+(?!\d))/g, '.');
+                            if (context.dataset.label === 'Inserted' || context.dataset.label === 'Updated') {{
+                                value = Math.round(value).toString().replace(/\B(?=(\d{{3}})+(?!\d))/g, '.');
+                            }} else {{
+                                value = value.toFixed(2).replace('.', ',').replace(/\B(?=(\d{{3}})+(?!\d))/g, '.');
+                            }}
                             return context.dataset.label + ': ' + value;
                         }}
                     }}
