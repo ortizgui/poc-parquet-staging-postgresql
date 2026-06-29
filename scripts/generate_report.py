@@ -705,7 +705,7 @@ def generate_report(csv_file, output_file=None):
                             if (value === null) return '';
                             if (context.dataset.label === 'Inserted' || context.dataset.label === 'Updated') {{
                                 value = Math.round(value).toString().replace(/\B(?=(\d{{3}})+(?!\d))/g, '.');
-                            }} else if (context.dataset.label === 'Throughput (regs/s)') {{
+                            }} else if (context.dataset.label === 'Throughput (regs/s)' || context.dataset.label === 'Average Throughput') {{
                                 value = Math.round(value).toString().replace(/\B(?=(\d{{3}})+(?!\d))/g, '.');
                             }} else {{
                                 value = value.toFixed(2).replace('.', ',').replace(/\B(?=(\d{{3}})+(?!\d))/g, '.');
