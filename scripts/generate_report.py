@@ -122,12 +122,15 @@ def prepare_chart_data(df):
         else:
             throughput_per_batch.append(0)
 
+    avg_throughput = sum(throughput_per_batch) / len(throughput_per_batch) if throughput_per_batch else 0
+
     return {
         "batchNumbers": [int(x) for x in df['batch'].values],
         "throughput": throughput_per_batch,
         "inserted": [int(x) for x in df['inserted'].values],
         "updated": [int(x) for x in df['updated'].values],
         "batchTimeMs": [float(x) for x in df['batch_time_ms'].values],
+        "averageThroughput": avg_throughput,
     }
 
 
@@ -709,9 +712,30 @@ def generate_report(csv_file, output_file=None):
                     tension: 0.4,
                     pointRadius: 4,
                     pointHoverRadius: 6
+                }}, {{
+                    label: 'Average Throughput',
+                    data: Array(chartData.batchNumbers.length).fill(chartData.averageThroughput),
+                    borderColor: '#FFD93D',
+                    backgroundColor: 'transparent',
+                    borderDash: [5, 5],
+                    pointRadius: 0,
+                    pointHoverRadius: 0
                 }}]
             }},
-            options: chartOptions
+            options: {{
+                ...chartOptions,
+                scales: {{
+                    x: {{
+                        grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                        ticks: {{ color: '#888' }}
+                    }},
+                    y: {{
+                        grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                        ticks: {{ color: '#888' }},
+                        suggestedMax: 15000
+                    }}
+                }}
+            }}
         }});
 
         new Chart(document.getElementById('chart-inserted-updated'), {{
