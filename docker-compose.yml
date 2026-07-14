@@ -33,47 +33,23 @@ services:
       timeout: 5s
       retries: 5
 
-  consumer1:
+  # Consumer: consome eventos S3 da SQS e faz bulk insert direto na custody_position
+  # Para escalar: docker compose up -d --scale consumer=3
+  consumer:
     build:
       context: .
-      dockerfile: Dockerfile.consumer1
-    container_name: poc-consumer1
+      dockerfile: Dockerfile.consumer
+    container_name: poc-consumer
     environment:
       POSTGRES_HOST: postgres
       AWS_ENDPOINT_URL: http://ministack:4566
+      CONSUMER_TARGET: direct
     depends_on:
       postgres:
         condition: service_healthy
       ministack:
         condition: service_healthy
-
-  consumer2:
-    build:
-      context: .
-      dockerfile: Dockerfile.consumer2
-    container_name: poc-consumer2
-    environment:
-      POSTGRES_HOST: postgres
-      AWS_ENDPOINT_URL: http://ministack:4566
-    depends_on:
-      postgres:
-        condition: service_healthy
-      ministack:
-        condition: service_healthy
-
-  merge:
-    build:
-      context: .
-      dockerfile: Dockerfile.merge
-    container_name: poc-merge
-    environment:
-      POSTGRES_HOST: postgres
-      AWS_ENDPOINT_URL: http://ministack:4566
-    depends_on:
-      postgres:
-        condition: service_healthy
-      ministack:
-        condition: service_healthy
+    command: ["python", "consume_s3_event.py"]
 
 volumes:
   pgdata:

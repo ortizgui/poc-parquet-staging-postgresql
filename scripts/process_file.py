@@ -4,8 +4,13 @@ Download and process a Parquet file from S3 using streaming row groups.
 Key concepts demonstrated for production scale:
   1. Streaming row groups via s3fs (Range GET requests) — never loads the full file
   2. Parallel row group processing — each worker gets its own S3 + DB connection
-  3. Checkpoint/resume — ON CONFLICT + last row tracking
-  4. Idempotent error table with UNIQUE constraint
+  3. Checkpoint/resume — ON CONFLICT + last row tracking (staging mode)
+  4. Direct insert with ON CONFLICT DO UPDATE (direct mode)
+  5. Idempotent error table with UNIQUE constraint
+
+Modes:
+  --target staging  → inserts into custody_position_staging (original behavior)
+  --target direct   → inserts directly into custody_position with ON CONFLICT DO UPDATE
 """
 
 import argparse
@@ -84,6 +89,7 @@ def process_row_group(
     source_file: str,
     start_row: int,
     chunk_size: int,
+    target: str = "staging",
 ) -> dict:
     """Download and process a single Parquet row group.
 
@@ -116,7 +122,10 @@ def process_row_group(
     conn = get_db_conn()
     cur = conn.cursor()
 
-    result = {"rg": rg_idx, "valid": 0, "invalid": 0, "duplicate": 0, "rows": 0}
+    if target == "direct":
+        result = {"rg": rg_idx, "inserted": 0, "updated": 0, "invalid": 0, "rows": 0}
+    else:
+        result = {"rg": rg_idx, "valid": 0, "invalid": 0, "duplicate": 0, "rows": 0}
 
     try:
         # --- 1. Stream one row-group from S3 via Range requests ---
@@ -163,35 +172,56 @@ def process_row_group(
                     "; ".join(errors),
                 ))
             else:
-                record_hash = compute_record_hash(row)
-                valid_rows.append((
-                    str(batch_id), source_file, row_number, record_hash,
-                    row["account_id"], row["asset_id"],
-                    ref_date, row["quantity"], row["amount"],
-                ))
+                if target == "direct":
+                    valid_rows.append((
+                        row["account_id"], row["asset_id"],
+                        ref_date, row["quantity"], row["amount"],
+                    ))
+                else:
+                    record_hash = compute_record_hash(row)
+                    valid_rows.append((
+                        str(batch_id), source_file, row_number, record_hash,
+                        row["account_id"], row["asset_id"],
+                        ref_date, row["quantity"], row["amount"],
+                    ))
 
         # ──────────────────────────────────────────────────────────────
         #  PASSO 3: INSERT EM BATCH — VALIDAS (1 statement)
         # ──────────────────────────────────────────────────────────────
-        #  execute_values() monta UM unico INSERT com TODAS as tuplas:
-        #
-        #    INSERT INTO staging VALUES (linha1), (linha2), ..., (linhaN)
-        #    ON CONFLICT DO NOTHING
-        #
-        #  Em vez de 5000 INSERTs individuais, fazemos 1 so.
-        #  cur.rowcount = quantas foram realmente inseridas
-        #  (ON CONFLICT ignora duplicatas, nao as conta)
-        # ──────────────────────────────────────────────────────────────
         if valid_rows:
-            execute_values(cur, """
-                INSERT INTO custody_position_staging
-                    (batch_id, source_file, row_number, record_hash,
-                     account_id, asset_id, reference_date, quantity, amount)
-                VALUES %s
-                ON CONFLICT (source_file, row_number) DO NOTHING
-            """, valid_rows)
-            result["valid"] = cur.rowcount
-            result["duplicate"] = len(valid_rows) - cur.rowcount
+            if target == "direct":
+                BATCH_SIZE = 5000
+                INSERTED = 0
+                UPDATED = 0
+                for batch_start in range(0, len(valid_rows), BATCH_SIZE):
+                    batch = valid_rows[batch_start:batch_start + BATCH_SIZE]
+                    batch_result = execute_values(cur, """
+                        INSERT INTO custody_position
+                            (account_id, asset_id, reference_date, quantity, amount)
+                        VALUES %s
+                        ON CONFLICT (account_id, asset_id, reference_date) DO UPDATE
+                        SET quantity = EXCLUDED.quantity,
+                            amount = EXCLUDED.amount,
+                            updated_at = NOW()
+                        RETURNING (xmax = 0) AS inserted
+                    """, batch, fetch=True, page_size=len(batch))
+                    for (is_ins,) in batch_result:
+                        if is_ins:
+                            INSERTED += 1
+                        else:
+                            UPDATED += 1
+                result["inserted"] = INSERTED
+                result["updated"] = UPDATED
+            else:
+                execute_values(cur, """
+                    INSERT INTO custody_position_staging
+                        (batch_id, source_file, row_number, record_hash,
+                         account_id, asset_id, reference_date, quantity, amount)
+                    VALUES %s
+                    ON CONFLICT (source_file, row_number) DO NOTHING
+                """, valid_rows, page_size=len(valid_rows))
+                result["valid"] = cur.rowcount
+                result["duplicate"] = len(valid_rows) - cur.rowcount
 
         # ──────────────────────────────────────────────────────────────
         #  PASSO 4: INSERT EM BATCH — INVALIDAS (1 statement)
@@ -232,10 +262,14 @@ def process_row_group(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process a Parquet file from S3 into staging (streaming + parallel)"
+        description="Process a Parquet file from S3 (staging or direct target)"
     )
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--key", required=True)
+    parser.add_argument(
+        "--target", choices=["staging", "direct"], default="staging",
+        help="Insert target: staging table or direct to custody_position (default: staging)",
+    )
     parser.add_argument(
         "--chunk-size", type=int, default=5,
         help="Rows per validation batch (delegated to row-group level)",
@@ -248,6 +282,7 @@ def main():
 
     print(f"batch_id: {batch_id}")
     print(f"Arquivo: {source_file}")
+    print(f"Target: {args.target}")
     print(f"Workers: {MAX_WORKERS}")
 
     # -----------------------------------------------------------------------
@@ -277,33 +312,44 @@ def main():
             current_row += rg_rows
 
     # -----------------------------------------------------------------------
-    # Phase 2 — Checkpoint: skip row groups already fully processed
+    # Phase 2 — Checkpoint (staging mode only)
     # -----------------------------------------------------------------------
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COALESCE(MAX(row_number), -1) FROM custody_position_staging WHERE source_file = %s",
-        (source_file,),
-    )
-    last_processed = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-
     rg_to_process = [
         (rg_idx, start)
         for rg_idx, start, end in row_group_ranges
-        if start > last_processed
     ]
-    print(f"Row groups pendentes: {len(rg_to_process)}/{num_row_groups}")
 
-    if not rg_to_process:
-        print("Nada a processar (checkpoint retomou de onde parou).")
-        return
+    if args.target == "staging":
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(MAX(row_number), -1) FROM custody_position_staging WHERE source_file = %s",
+            (source_file,),
+        )
+        last_processed = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+
+        rg_to_process = [
+            (rg_idx, start)
+            for rg_idx, start, end in row_group_ranges
+            if start > last_processed
+        ]
+        print(f"Row groups pendentes: {len(rg_to_process)}/{num_row_groups}")
+
+        if not rg_to_process:
+            print("Nada a processar (checkpoint retomou de onde parou).")
+            return
+    else:
+        print(f"Modo direct: processando todos os {len(rg_to_process)} row groups (sem checkpoint)")
 
     # -----------------------------------------------------------------------
     # Phase 3 — Parallel row-group processing
     # -----------------------------------------------------------------------
-    aggregator = {"valid": 0, "invalid": 0, "duplicate": 0, "rows": 0}
+    if args.target == "direct":
+        aggregator = {"inserted": 0, "updated": 0, "invalid": 0, "rows": 0}
+    else:
+        aggregator = {"valid": 0, "invalid": 0, "duplicate": 0, "rows": 0}
 
     with ThreadPoolExecutor(
         max_workers=min(MAX_WORKERS, len(rg_to_process))
@@ -318,6 +364,7 @@ def main():
                 source_file,
                 rg_start,
                 args.chunk_size,
+                args.target,
             )
             future_map[fut] = rg_idx
 
@@ -325,15 +372,23 @@ def main():
             rg_idx = future_map[future]
             try:
                 res = future.result()
-                for k in ("valid", "invalid", "rows"):
-                    aggregator[k] += res[k]
-                aggregator["duplicate"] += res.get("duplicate", 0)
-                print(
-                    f"  RG {rg_idx:>2}: {res['valid']:>3} validos, "
-                    f"{res['invalid']:>3} invalidos, "
-                    f"{res['duplicate']:>3} duplicatas, "
-                    f"{res['rows']:>3} linhas"
-                )
+                for k in res:
+                    if k != "rg" and k in aggregator:
+                        aggregator[k] += res[k]
+                if args.target == "direct":
+                    print(
+                        f"  RG {rg_idx:>2}: +{res['inserted']:>3} ins "
+                        f"~{res['updated']:>3} upd "
+                        f"-{res['invalid']:>3} err "
+                        f"({res['rows']:>3} rows)"
+                    )
+                else:
+                    print(
+                        f"  RG {rg_idx:>2}: {res['valid']:>3} validos, "
+                        f"{res['invalid']:>3} invalidos, "
+                        f"{res.get('duplicate', 0):>3} duplicatas, "
+                        f"{res['rows']:>3} linhas"
+                    )
             except Exception as e:
                 print(f"  [ERRO] Row group {rg_idx}: {e}")
 
@@ -343,9 +398,14 @@ def main():
     print(f"\nResumo final:")
     print(f"  batch_id:          {batch_id}")
     print(f"  total lido:        {aggregator['rows']}")
-    print(f"  total valido:      {aggregator['valid']}")
-    print(f"  total invalido:    {aggregator['invalid']}")
-    print(f"  duplicatas:        {aggregator['duplicate']}")
+    if args.target == "direct":
+        print(f"  inseridos:         +{aggregator['inserted']}")
+        print(f"  atualizados:       ~{aggregator['updated']}")
+        print(f"  invalidos:         -{aggregator['invalid']}")
+    else:
+        print(f"  total valido:      {aggregator['valid']}")
+        print(f"  total invalido:    {aggregator['invalid']}")
+        print(f"  duplicatas:        {aggregator['duplicate']}")
     print(f"  row groups proc.:  {len(rg_to_process)}")
 
 

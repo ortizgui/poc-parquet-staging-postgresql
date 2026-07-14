@@ -2,6 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY scripts/merge_buffer.py .
+COPY scripts/consume_s3_event.py .
+COPY scripts/process_file.py .
 COPY .env .
-CMD ["python", "merge_buffer.py"]
+CMD ["python", "consume_s3_event.py"]
