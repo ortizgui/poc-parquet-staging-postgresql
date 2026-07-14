@@ -17,11 +17,13 @@ flowchart TD
     S3_BUCKET -->|default| S3_EVENT
 ```
 
+
 ## Fluxo de Dados
 
 ### Fluxo A — Direct Insert (Produção — default)
 
 ```
+
 1. S3: Arquivos Parquet chegam (até 5.000 registros cada)
        ↓
 2. S3 Event Notification → SQS (Captura Carteira)
@@ -32,6 +34,7 @@ flowchart TD
        ↓
 5. custody_position: Dados disponíveis para aplicações
 ```
+
 
 ## Scripts Disponíveis
 
@@ -46,15 +49,22 @@ flowchart TD
 | `upload_to_s3.py` | Utilitário de upload para S3 |
 | `create_sample_file.py` | Cria arquivo de amostra |
 
+## Pré-requisitos
+
+- **Docker** + Docker Compose
+- **Python 3.12+** com `pip` (para scripts de infra/geração)
+- **.NET 10 SDK** (opcional — apenas para desenvolvimento local; o build é feito via Docker)
+
 ## Teste Completo End-to-End
 
-### Fluxo de Produção (Direct Insert)
+O script `run_complete_test.sh` orquestra o fluxo completo automaticamente:
 
 ```bash
-./run_complete_test.sh --target direct --files 10 --records-per-file 5000 --consumers 3
+./run_complete_test.sh --files 10 --records-per-file 5000 --consumers 3
 ```
 
-**Resultado**: 10 arquivos × 5.000 registros = **50.000 registros** processados por 3 consumers paralelos
+
+**Resultado**: 10 arquivos × 5.000 registros = **50.000 registros** processados por 3 consumers paralelos.
 
 ### Opções do run_complete_test.sh
 
@@ -62,35 +72,75 @@ flowchart TD
 |-------|---------|-----------|
 | `--files` | 10 | Número de arquivos Parquet |
 | `--records-per-file` | 5000 | Registros por arquivo |
-| `--existing` | 100000 | Registros existentes na base |
+| `--existing` | 100000 | Registros existentes na base (opcional) |
 | `--consumers` | 2 | Número de consumers paralelos |
 | `--keep-docker` | false | Não recria Docker (mais rápido) |
 | `--output` | metrics_*.csv | Arquivo CSV de saída |
 
-## Uso Individual
+## Uso Passo a Passo
 
-### 1. Setup
+### 1. Setup do ambiente
 
 ```bash
-# Subir serviços
+# Sobe PostgreSQL + LocalStack + Worker .NET
 docker compose up -d
 
-# Setup infraestrutura (S3, SQS, SNS opcional)
+# Cria infraestrutura S3 + SQS + S3 Bucket Notification
 python3 scripts/setup_infra.py
 ```
 
-### 2. Gerar e processar Parquets — Fluxo de Produção (Direct Insert)
+
+> O consumer .NET inicia automaticamente com o Docker. Ele pode logar
+> `QueueDoesNotExistException` até o `setup_infra.py` criar a fila —
+> é normal, o retry automático conecta assim que a fila existir.
+
+### 2. Gerar dados e processar
 
 ```bash
-# Gerar múltiplos arquivos Parquet e subir para S3
+# Gera arquivos Parquet e faz upload para o S3
 python3 scripts/generate_parquets.py --count 10 --records-per-file 5000
+```
 
-# O worker .NET roda automaticamente via Docker Compose
-# Para múltiplos consumers paralelos:
+
+A **S3 Notification** configurada no passo 1 detecta os novos arquivos
+automaticamente e envia eventos para a fila SQS. O worker .NET consome
+a fila, baixa cada Parquet do S3, valida as linhas e insere diretamente
+na tabela `custody_position` com `ON CONFLICT DO UPDATE`.
+
+Para múltiplos consumers paralelos (simula N tarefas ECS):
+
+```bash
 docker compose up -d --scale consumer=3
 ```
 
-### 3. Gerar relatório HTML
+
+### 3. Verificar o processamento
+
+```bash
+# Logs do worker .NET
+docker compose logs consumer --tail 50
+
+# Contagem de registros na tabela principal
+docker compose exec postgres psql -U pocuser -d pocdb \
+  -c "SELECT COUNT(*) AS total FROM custody_position;"
+
+# Registros com erro (deve ser 0)
+docker compose exec postgres psql -U pocuser -d pocdb \
+  -c "SELECT COUNT(*) AS errors FROM custody_position_error;"
+
+# Profundidade da fila SQS (deve ser 0 ao final)
+python3 -c "
+import boto3
+sqs = boto3.client('sqs', endpoint_url='http://localhost:4566',
+    aws_access_key_id='test', aws_secret_access_key='test', region_name='us-east-1')
+url = sqs.get_queue_url(QueueName='poc-notification-queue')['QueueUrl']
+attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=['ApproximateNumberOfMessages'])
+print(f'Queue depth: {attrs[\"Attributes\"][\"ApproximateNumberOfMessages\"]}')
+"
+```
+
+
+### 4. Gerar relatório HTML
 
 ```bash
 python3 scripts/generate_report.py metrics.csv
@@ -103,6 +153,7 @@ O worker ECS é uma aplicação .NET 10 que substitui os scripts Python `consume
 ### Estrutura
 
 ```
+
 src/Worker/
 ├── Worker.csproj                 # Projeto .NET 10
 ├── Program.cs                    # Entry point (Host.CreateDefaultBuilder)
@@ -117,6 +168,7 @@ src/Worker/
     └── DatabaseService.cs        # Bulk insert PostgreSQL
 ```
 
+
 ### Bibliotecas
 
 - **AWSSDK.S3** — Download de Parquet do S3
@@ -127,7 +179,7 @@ src/Worker/
 
 ### Funcionalidades
 
-- Suporta `--target direct` (default) e `--target staging` (legado)
+- Suporta modo direct insert (default) com ON CONFLICT DO UPDATE
 - `--consumer-id` para logging em múltiplas instâncias
 - `--max-messages` para limitar número de mensagens processadas
 - Polling de profundidade da fila SQS a cada mensagem
