@@ -1,99 +1,102 @@
-# POC — Ingestão Massiva de Dados: Parquet → Staging → Principal
+# POC — Ingestão Massiva de Dados: Parquet → PostgreSQL (Direct Insert / Staging Merge)
 
-Prova de conceito do fluxo de ingestão massiva de dados com staging table e merge controlado.
+Prova de conceito do fluxo de ingestão massiva de dados com suporte a dois modos de operação.
 
 ## Arquitetura
 
 ```mermaid
 flowchart TD
-    subgraph S3 ["S3 (Origem dos Dados)"]
-        PARQUET[Arquivos Parquet<br/>até 5.000 registros cada]
+    S3_BUCKET[S3<br/>Parquet Files]
+    
+    subgraph DIRECT ["Produção — Direct Insert (default)"]
+        S3_EVENT[S3 Event Notification] --> SQS_DIRECT[SQS<br/>Captura Carteira]
+        SQS_DIRECT --> ECS_CONSUMER[ECS Consumer<br/>Bulk Insert<br/>ON CONFLICT DO UPDATE]
+        ECS_CONSUMER --> PRINCIPAL_DIRECT[custody_position<br/>Tabela Principal]
     end
 
-    subgraph SNS ["SNS (Notificação)"]
-        NOTIFICATION[SNS Topic<br/>Notifica novo arquivo]
+    subgraph LEGACY ["Legado — Staging + Merge"]
+        SNS[SNS Topic] --> SQS_LEGACY[SQS]
+        SQS_LEGACY --> ECS_STAGING[ECS Consumer<br/>Bulk Insert]
+        ECS_STAGING --> STAGING_TABLE[custody_position_staging]
+        STAGING_TABLE --> MERGE[merge_staging.py<br/>Batch Upsert]
+        MERGE --> PRINCIPAL_LEGACY[custody_position<br/>Tabela Principal]
     end
 
-    subgraph ECS ["ECS Service (Consumer)"]
-        CONSUMER[Consumer ECS<br/>Lê Parquet<br/>Bulk INSERT<br/>Staging Table]
-    end
-
-    subgraph STAGING ["PostgreSQL - Staging"]
-        STAGING_TABLE[custody_position_staging<br/>Landing Zone<br/>Append-only<br/>Idempotente]
-        ERROR_TABLE[custody_position_error<br/>Registros inválidos]
-    end
-
-    subgraph CRON ["Merge Job (Cron/Scheduler)"]
-        MERGE[merge_staging.py<br/>Batch Upsert<br/>INSERT/UPDATE<br/>DELETE from Staging]
-    end
-
-    subgraph PRINCIPAL ["PostgreSQL - Principal"]
-        FINAL_TABLE[custody_position<br/>Tabela Final<br/>Produção]
-    end
-
-    PARQUET -->|S3 Event| SNS
-    SNS -->|Fanout| CONSUMER
-    CONSUMER -->|Bulk INSERT| STAGING_TABLE
-    CONSUMER -->|Invalid Rows| ERROR_TABLE
-    STAGING_TABLE -->|Merge em batches| MERGE
-    MERGE -->|INSERT/UPDATE| FINAL_TABLE
-    MERGE -->|DELETE merged| STAGING_TABLE
+    S3_BUCKET -->|default| S3_EVENT
+    S3_BUCKET -.->|--sns| SNS
 ```
 
 ## Fluxo de Dados
 
+### Fluxo A — Direct Insert (Produção — default)
+
 ```
 1. S3: Arquivos Parquet chegam (até 5.000 registros cada)
        ↓
-2. SNS: Notificação enviada ao ECS Consumer
+2. S3 Event Notification → SQS (Captura Carteira)
        ↓
-3. ECS: Lê parquet e faz bulk insert na staging table
+3. ECS Consumer: Lê parquet e faz bulk insert direto na principal
        ↓
-4. Staging: Dados aguardam processamento
+4. ON CONFLICT (account_id, asset_id, reference_date) DO UPDATE
        ↓
-5. Cron: merge_staging.py roda a cada X segundos
+5. custody_position: Dados disponíveis para aplicações
+```
+
+### Fluxo B — Staging + Merge (Legado)
+
+```
+1. S3: Arquivos Parquet chegam (até 5.000 registros cada)
        ↓
-6. Merge: INSERT novos + UPDATE modificados + DELETE da staging
+2. SNS → SQS (notificação)
        ↓
-7. Principal: Dados disponíveis para aplicações
+3. ECS Consumer: Lê parquet e faz bulk insert na staging table
+       ↓
+4. custody_position_staging: Dados aguardam processamento
+       ↓
+5. merge_staging.py: INSERT novos + UPDATE modificados + DELETE da staging
+       ↓
+6. custody_position: Dados disponíveis para aplicações
 ```
 
 ## Scripts Disponíveis
 
-| Script | Função |
-|--------|--------|
-| `process_file.py` | Lê parquet do S3 e insere na staging (bulk insert) |
-| `merge_staging.py` | Merge da staging para principal (batch + throttle) |
+| Script | Descrição |
+|--------|-----------|
+| `process_file.py` | Lê parquet do S3 e insere na staging (`--target staging`) ou direto na principal (`--target direct`) |
+| `consume_s3_event.py` | Consumer que polling SQS e chama process_file.py. Suporta `--consumer-id` para paralelismo |
+| `setup_infra.py` | Cria S3 + S3 Bucket Notification → SQS (padrão). Use `--sns` para criar SNS também |
+| `simulate_s3_notification.py` | Simula notificação S3. Use `--mode sns` (SNS) ou `--mode sqs` (SQS direto) |
+| `merge_staging.py` | Merge da staging para principal (fluxo legado) |
 | `simulate_load.py` | Simula carga para validação (testa só o merge) |
 | `generate_report.py` | Gera relatório HTML das métricas |
 | `seed_database.py` | Preenche base com dados de teste |
-| `setup_infra.py` | Cria infraestrutura S3/SNS/SQS no LocalStack |
-| `consume_s3_event.py` | Consumer que polling SQS e chama process_file.py |
 | `generate_parquets.py` | Gera múltiplos arquivos Parquet e sobe para S3 |
-| `simulate_s3_notification.py` | Simula notificação SNS (S3 Event) |
 
 ## Teste Completo End-to-End
 
-### Teste Aurora-like (40 arquivos)
+### Fluxo de Produção (Direct Insert)
 
 ```bash
-./run_complete_test.sh --files 40 --records-per-file 5000 --existing 100000 --batch 2000 --delay 0.5
+./run_complete_test.sh --target direct --files 10 --records-per-file 5000 --consumers 3
+```
+
+**Resultado**: 10 arquivos × 5.000 registros = **50.000 registros** processados por 3 consumers paralelos
+
+### Fluxo Legado (Staging + Merge)
+
+```bash
+./run_complete_test.sh --target staging --files 10 --records-per-file 5000 --batch 2000 --delay 0.5
+```
+
+**Resultado**: 10 arquivos × 5.000 registros = **50.000 registros** via staging + merge
+
+### Teste Aurora-like (40 arquivos — staging)
+
+```bash
+./run_complete_test.sh --target staging --files 40 --records-per-file 5000 --existing 100000 --batch 2000 --delay 0.5
 ```
 
 **Resultado**: 40 arquivos × 5.000 registros = **200.000 registros** totais
-
-Parametros:
-- `--files 40`: 40 arquivos Parquet
-- `--records-per-file 5000`: 5.000 registros por arquivo
-- `--existing 100000`: 100k registros ja existentes na tabela principal
-- `--batch 2000`: batch size do merge (sweet spot identificado)
-- `--delay 0.5`: delay entre batches (sweet spot para throttle)
-
-### Teste Rápido (10 arquivos)
-
-```bash
-./run_complete_test.sh --files 10 --records-per-file 5000 --existing 100000
-```
 
 ### Opções do run_complete_test.sh
 
@@ -102,8 +105,10 @@ Parametros:
 | `--files` | 10 | Número de arquivos Parquet |
 | `--records-per-file` | 5000 | Registros por arquivo |
 | `--existing` | 100000 | Registros existentes na base |
-| `--batch` | 2000 | Batch size do merge |
-| `--delay` | 0.5 | Delay entre batches (segundos) |
+| `--target` | direct | `direct` (produção) ou `staging` (merge legado) |
+| `--consumers` | 2 | Número de consumers paralelos (modo direct) |
+| `--batch` | 2000 | Batch size do merge (modo staging) |
+| `--delay` | 0.5 | Delay entre batches (modo staging) |
 | `--keep-docker` | false | Não recria Docker (mais rápido) |
 | `--output` | metrics_*.csv | Arquivo CSV de saída |
 
@@ -115,31 +120,38 @@ Parametros:
 # Subir serviços
 docker compose up -d
 
-# Setup infraestrutura (S3, SNS, SQS)
+# Setup infraestrutura (S3, SQS, SNS opcional)
 python3 scripts/setup_infra.py
 ```
 
-### 2. Gerar e processar Parquets
+### 2. Gerar e processar Parquets — Fluxo de Produção (Direct Insert)
 
 ```bash
 # Gerar múltiplos arquivos Parquet e subir para S3
 python3 scripts/generate_parquets.py --count 10 --records-per-file 5000
 
-# Simular notificação SNS para cada arquivo
-python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_xxxx.parquet
+# Rodar consumer (modo direct, padrão)
+python3 scripts/consume_s3_event.py --consumer-id 1
 
-# OU: rodar o consumer que polling SQS automaticamente
-python3 scripts/consume_s3_event.py
+# Ou: múltiplos consumers em paralelo
+python3 scripts/consume_s3_event.py --consumer-id 1 --target direct &
+python3 scripts/consume_s3_event.py --consumer-id 2 --target direct &
 ```
 
-### 3. Merge para tabela principal (Cron)
+### 3. Fluxo Legado (Staging + Merge)
 
 ```bash
-# Com configurações padrão
-python3 scripts/merge_staging.py
+# Gerar múltiplos arquivos Parquet e subir para S3
+python3 scripts/generate_parquets.py --count 10 --records-per-file 5000
 
-# Ou com configurações customizadas
-MERGE_BATCH_SIZE=2000 MERGE_DELAY_SECONDS=0.5 python3 scripts/merge_staging.py
+# Simular notificação SNS
+python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key input/custody_xxx.parquet
+
+# Consumer (modo staging)
+python3 scripts/consume_s3_event.py --target staging
+
+# Merge para principal
+python3 scripts/merge_staging.py
 ```
 
 ### 4. Simular carga de produção (apenas merge)
@@ -161,16 +173,6 @@ python3 scripts/generate_report.py metrics.csv
 ```
 
 ## Parâmetros
-
-### run_complete_test.sh
-
-| Variável | Default | Descrição |
-|----------|---------|-----------|
-| `--files` | 10 | Número de arquivos Parquet |
-| `--records-per-file` | 5000 | Registros por arquivo |
-| `--existing` | 100000 | Registros existentes na base |
-| `--batch` | 2000 | Batch size do merge |
-| `--delay` | 0.5 | Delay entre batches (segundos) |
 
 ### simulate_load.py
 
@@ -198,9 +200,11 @@ python3 scripts/generate_report.py metrics.csv
 | `--records-per-file` | 5000 | Registros por arquivo |
 | `--prefix` | input/ | Prefixo da chave S3 |
 
-## Merge Staging (merge_staging.py)
+## Merge Staging (merge_staging.py) — Fluxo Legado
 
-Este script é destinado a rodar como CRON/JobScheduler.
+> Este fluxo é mantido para backward compatibility. O fluxo padrão de produção usa direct insert.
+
+Script destinado a rodar como CRON/JobScheduler.
 
 ### Fluxo do Merge
 
@@ -224,7 +228,7 @@ Para cada batch:
 
 ## Resultados dos Testes
 
-### Teste: 1M registros, 60% updates
+### Teste: 1M registros, 60% updates (staging)
 
 | Métrica | Valor |
 |---------|-------|
@@ -239,7 +243,7 @@ Para cada batch:
 |-----------|-------------|--------------|
 | r6g.xlarge (4 vCPU, 32GB) | ~12 min | ~46 min |
 
-### Teste Completo (40 arquivos × 5000 registros)
+### Teste Completo (40 arquivos × 5000 registros — staging)
 
 | Métrica | Valor |
 |---------|-------|
@@ -248,22 +252,28 @@ Para cada batch:
 | Batch Size | 2000 |
 | Delay | 0.5s |
 
-## Padrões de Resiliencia
+## Padrões de Resiliência
 
 ### Idempotência
 
-- Unique constraint em `(source_file, row_number)` garante que mesmo parquet processado 2x não duplica
-- Merge usa DELETE após sucesso
+- **Modo direct**: `ON CONFLICT (account_id, asset_id, reference_date) DO UPDATE` garante upsert seguro
+- **Modo staging**: Unique constraint em `(source_file, row_number)` garante que mesmo parquet processado 2x não duplica. Merge usa DELETE após sucesso
 
 ### Retry
 
 - Consumer ECS: retry automático via SQS visibility timeout
-- Merge: se falhar, registros permanecem na staging para próxima execução
+- Modo staging: merge falhou → registros permanecem na staging para próxima execução
 
 ### Dead Letter Queue
 
 - Registros inválidos vão para `custody_position_error`
 - Payload JSONB preserva dados originais para investigação
+
+### Paralelismo (Modo Direct)
+
+- Múltiplos consumers rodam concorrentemente com `--consumer-id` distinto
+- Cada consumer polling a mesma fila SQS — mensagens distribuídas automaticamente
+- `ON CONFLICT DO UPDATE` garante consistência concorrente
 
 ## Stack
 
@@ -271,6 +281,6 @@ Para cada batch:
 |------------|------------|
 | Database | PostgreSQL 16 |
 | Object Storage | AWS S3 (LocalStack) |
-| Notifications | AWS SNS |
+| Notifications | S3 Event Notification → SQS (padrão) ou SNS (opcional) |
 | Compute | ECS Fargate (simulado localmente) |
 | Language | Python 3.12 |
