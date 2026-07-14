@@ -60,10 +60,13 @@ flowchart TD
 
 ## Scripts Disponíveis
 
+> O worker ECS foi reimplementado em .NET 10 (`src/Worker/`). 
+> Os scripts Python abaixo são mantidos como referência e para testes auxiliares.
+
 | Script | Descrição |
 |--------|-----------|
-| `process_file.py` | Lê parquet do S3 e insere na staging (`--target staging`) ou direto na principal (`--target direct`) |
-| `consume_s3_event.py` | Consumer que polling SQS e chama process_file.py. Suporta `--consumer-id` para paralelismo |
+| `process_file.py` | (Referência Python) Lê parquet do S3 e insere na staging/direct. Substituído pelo worker .NET |
+| `consume_s3_event.py` | (Referência Python) Consumer que polling SQS. Substituído pelo worker .NET |
 | `setup_infra.py` | Cria S3 + S3 Bucket Notification → SQS (padrão). Use `--sns` para criar SNS também |
 | `simulate_s3_notification.py` | Simula notificação S3. Use `--mode sns` (SNS) ou `--mode sqs` (SQS direto) |
 | `merge_staging.py` | Merge da staging para principal (fluxo legado) |
@@ -130,12 +133,9 @@ python3 scripts/setup_infra.py
 # Gerar múltiplos arquivos Parquet e subir para S3
 python3 scripts/generate_parquets.py --count 10 --records-per-file 5000
 
-# Rodar consumer (modo direct, padrão)
-python3 scripts/consume_s3_event.py --consumer-id 1
-
-# Ou: múltiplos consumers em paralelo
-python3 scripts/consume_s3_event.py --consumer-id 1 --target direct &
-python3 scripts/consume_s3_event.py --consumer-id 2 --target direct &
+# O worker .NET roda automaticamente via Docker Compose
+# Para múltiplos consumers paralelos:
+docker compose up -d --scale consumer=3
 ```
 
 ### 3. Fluxo Legado (Staging + Merge)
@@ -171,6 +171,44 @@ python3 scripts/simulate_load.py \
 ```bash
 python3 scripts/generate_report.py metrics.csv
 ```
+
+## Worker .NET (`src/Worker/`)
+
+O worker ECS é uma aplicação .NET 10 que substitui os scripts Python `consume_s3_event.py` e `process_file.py`.
+
+### Estrutura
+
+```
+src/Worker/
+├── Worker.csproj                 # Projeto .NET 10
+├── Program.cs                    # Entry point (Host.CreateDefaultBuilder)
+├── appsettings.json              # Configuração default
+├── Dockerfile                    # Multi-stage build (sdk → runtime)
+├── Models/
+│   ├── S3EventNotification.cs    # Modelo do evento S3
+│   └── ProcessResult.cs          # Resultado do processamento
+└── Services/
+    ├── SqsConsumerService.cs     # BackgroundService (polling SQS)
+    ├── ParquetProcessor.cs       # Leitura + validação de Parquet
+    └── DatabaseService.cs        # Bulk insert PostgreSQL
+```
+
+### Bibliotecas
+
+- **AWSSDK.S3** — Download de Parquet do S3
+- **AWSSDK.SQS** — Consumo de mensagens da fila
+- **Parquet.Net** — Leitura de arquivos Parquet (row groups)
+- **Npgsql** — Conexão PostgreSQL com bulk upsert
+- **Microsoft.Extensions.Hosting** — BackgroundService lifecycle
+
+### Funcionalidades
+
+- Suporta `--target direct` (default) e `--target staging` (legado)
+- `--consumer-id` para logging em múltiplas instâncias
+- `--max-messages` para limitar número de mensagens processadas
+- Polling de profundidade da fila SQS a cada mensagem
+- ON CONFLICT DO UPDATE com RETURNING para métricas precisas
+- Graceful shutdown via CancellationToken
 
 ## Parâmetros
 
@@ -282,5 +320,6 @@ Para cada batch:
 | Database | PostgreSQL 16 |
 | Object Storage | AWS S3 (LocalStack) |
 | Notifications | S3 Event Notification → SQS (padrão) ou SNS (opcional) |
-| Compute | ECS Fargate (simulado localmente) |
-| Language | Python 3.12 |
+| Compute | ECS Fargate (simulado localmente via consumer container) |
+| Worker Runtime | .NET 10 (C#) — src/Worker/ |
+| Infra/Scripts | Python 3.12 — scripts/ |
