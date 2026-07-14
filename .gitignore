@@ -30,3 +30,10 @@ reports/
 # .NET
 src/Worker/bin/
 src/Worker/obj/
+
+# Removed scripts (replaced by .NET worker)
+scripts/consume_s3_event.py
+scripts/process_file.py
+scripts/merge_staging.py
+scripts/simulate_load.py
+run_simulation.sh

@@ -47,17 +47,16 @@ public class SqsConsumerService : BackgroundService
         _pollWaitSeconds = consumer.GetValue<int>("PollWaitSeconds", 5);
     }
 
-    public override Task StartAsync(CancellationToken cancellationToken)
+    public override async Task StartAsync(CancellationToken cancellationToken)
     {
-        // LocalStack URL format: {ServiceURL}/000000000000/{QueueName}
-        var awsServiceUrl = _config.GetSection("AWS")["ServiceURL"] ?? "http://localhost:4566";
-        _queueUrl = $"{awsServiceUrl.TrimEnd('/')}/000000000000/{_queueName}";
+        var response = await _sqs.GetQueueUrlAsync(_queueName, cancellationToken);
+        _queueUrl = response.QueueUrl;
 
         _logger.LogInformation("[CONSUMER:{Id}] Starting. Queue={Queue}, Target={Target}",
             _consumerId, _queueUrl, _target);
 
         _startTime = DateTime.UtcNow;
-        return base.StartAsync(cancellationToken);
+        await base.StartAsync(cancellationToken);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

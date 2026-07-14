@@ -49,15 +49,15 @@ public class DatabaseService : IDisposable
         List<(string accountId, string assetId, DateTime refDate, decimal quantity, decimal amount)> batch,
         CancellationToken ct)
     {
-        var sb = new StringBuilder();
-        sb.Append("INSERT INTO custody_position (account_id, asset_id, reference_date, quantity, amount) VALUES ");
+        var insertSb = new StringBuilder();
+        insertSb.Append("INSERT INTO custody_position (account_id, asset_id, reference_date, quantity, amount) VALUES ");
         var parameters = new List<NpgsqlParameter>();
 
         for (int i = 0; i < batch.Count; i++)
         {
-            if (i > 0) sb.Append(", ");
+            if (i > 0) insertSb.Append(", ");
             var idx = i * 5;
-            sb.Append($"(${idx + 1}, ${idx + 2}, ${idx + 3}, ${idx + 4}, ${idx + 5})");
+            insertSb.Append($"(${idx + 1}, ${idx + 2}, ${idx + 3}, ${idx + 4}, ${idx + 5})");
             parameters.Add(new NpgsqlParameter<string> { TypedValue = batch[i].accountId });
             parameters.Add(new NpgsqlParameter<string> { TypedValue = batch[i].assetId });
             parameters.Add(new NpgsqlParameter<DateTime> { TypedValue = batch[i].refDate });
@@ -65,19 +65,36 @@ public class DatabaseService : IDisposable
             parameters.Add(new NpgsqlParameter<decimal> { TypedValue = batch[i].amount });
         }
 
-        sb.Append(" ON CONFLICT (account_id, asset_id, reference_date) DO UPDATE ");
-        sb.Append("SET quantity = EXCLUDED.quantity, amount = EXCLUDED.amount, updated_at = NOW() ");
-        sb.Append("RETURNING (xmax = 0) AS inserted");
+        insertSb.Append(" ON CONFLICT (account_id, asset_id, reference_date) DO NOTHING");
 
-        await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
-        cmd.Parameters.AddRange(parameters.ToArray());
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        await using var insertCmd = new NpgsqlCommand(insertSb.ToString(), conn);
+        insertCmd.Parameters.AddRange(parameters.ToArray());
+        int inserted = await insertCmd.ExecuteNonQueryAsync(ct);
 
-        int inserted = 0, updated = 0;
-        while (await reader.ReadAsync(ct))
+        // UPDATE only rows that already exist and have different values
+        var updateSb = new StringBuilder();
+        updateSb.Append("UPDATE custody_position f SET quantity = v.quantity, amount = v.amount, updated_at = NOW() FROM (VALUES ");
+        var updParams = new List<NpgsqlParameter>();
+
+        for (int i = 0; i < batch.Count; i++)
         {
-            if ((bool)reader[0]) inserted++; else updated++;
+            if (i > 0) updateSb.Append(", ");
+            var idx = i * 5;
+            updateSb.Append($"(${idx + 1}::varchar, ${idx + 2}::varchar, ${idx + 3}::date, ${idx + 4}::numeric, ${idx + 5}::numeric)");
+            updParams.Add(new NpgsqlParameter<string> { TypedValue = batch[i].accountId });
+            updParams.Add(new NpgsqlParameter<string> { TypedValue = batch[i].assetId });
+            updParams.Add(new NpgsqlParameter<DateTime> { TypedValue = batch[i].refDate });
+            updParams.Add(new NpgsqlParameter<decimal> { TypedValue = batch[i].quantity });
+            updParams.Add(new NpgsqlParameter<decimal> { TypedValue = batch[i].amount });
         }
+
+        updateSb.Append(") AS v(account_id, asset_id, reference_date, quantity, amount) ");
+        updateSb.Append("WHERE f.account_id = v.account_id AND f.asset_id = v.asset_id AND f.reference_date = v.reference_date ");
+        updateSb.Append("AND (f.quantity IS DISTINCT FROM v.quantity OR f.amount IS DISTINCT FROM v.amount)");
+
+        await using var updateCmd = new NpgsqlCommand(updateSb.ToString(), conn);
+        updateCmd.Parameters.AddRange(updParams.ToArray());
+        int updated = await updateCmd.ExecuteNonQueryAsync(ct);
 
         return (inserted, updated);
     }
