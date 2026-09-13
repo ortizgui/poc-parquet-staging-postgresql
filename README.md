@@ -109,6 +109,22 @@ for i in range(pf.metadata.num_row_groups):
 Multiplique o maior row group por **2 a 4×** (UTF-16 + overhead de objeto no .NET) e você tem o
 mínimo de RAM do pod para aquele arquivo.
 
+### Higiene do diretório temporário
+
+- **Pico de disco = 1 arquivo.** O consumer processa **uma mensagem por vez** e um arquivo por vez
+  (`MaxNumberOfMessages = 1`, processamento sequencial), e o temporário é nomeado com um GUID.
+  Não existe concorrência de arquivos dentro do container.
+- **`ephemeralStorage` no Fargate é por task**, não compartilhado: encheu, morre aquela task. No
+  launch type EC2 com volume de host, ou com EFS montado como `TempPath`, o disco passa a ser
+  compartilhado e aí uma task enche o disco de todas.
+- **Órfãos de `OOMKilled`**: um SIGKILL não roda o `finally`, então o `.parquet` fica no disco. Na
+  inicialização o worker remove apenas os arquivos **do próprio consumer** (prefixo `ConsumerId`) e
+  **mais antigos que `Consumer:TempRetentionHours`** — nunca "tudo", para ser seguro mesmo com
+  `TempPath` em volume compartilhado.
+- **Paralelismo em produção vem de tasks**, não de workers: escale com
+  `--scale consumer=N` (ou o desired count da task no ECS). Cada task tem o próprio disco e o
+  próprio row group, então o custo de memória e de disco é por task.
+
 ### Como ler a curva de memória (evita falso negativo)
 
 Com flush por row group, **não espere dente de serra** no gráfico. O GC do .NET não devolve memória
@@ -208,7 +224,7 @@ O dashboard `POC Ingestão Parquet — Paginação e Memória` é **provisionado
 |---------------|---------|---------|
 | **Traffic** | linhas/s, MB/s do S3, row groups e arquivos | `poc_parquet_rows_processed_total`, `poc_parquet_bytes_downloaded_total`, `poc_parquet_row_groups_total`, `poc_ingest_files_total` |
 | **Latency** | p50/p95 por row group, p50/p95 do upsert | `poc_parquet_rowgroup_read_seconds`, `poc_db_upsert_seconds` |
-| **Errors** | inválidos/min, OOM e restarts do pod | `poc_ingest_invalid_records_total`, `container_oom_events_total`, `container_start_time_seconds` |
+| **Errors** | inválidos/min, OOM e restarts do pod, falhas de mensagem, profundidade da DLQ | `poc_ingest_invalid_records_total`, `poc_sqs_message_failures_total`, `poc_sqs_messages_sent_to_dlq_total`, `poc_sqs_dlq_depth`, `container_oom_events_total`, `container_start_time_seconds` |
 | **Saturation** | memória do pod (% do limite), working set vs heap do GC, CPU e throttling | `container_memory_working_set_bytes` ÷ `container_spec_memory_limit_bytes`, `dotnet_total_memory_bytes`, `container_cpu_cfs_throttled_periods_total` |
 
 O golden signal de **saturation é do pod**, não do processo — por isso o `cadvisor` é obrigatório:
@@ -336,8 +352,12 @@ src/Worker/
 |-----------|---------|--------|
 | `Consumer:FlushBatchSize` | 2000 | Linhas acumuladas antes de cada flush no banco. **É o principal controle de pico de memória por lote** |
 | `Consumer:TempPath` | `/tmp/poc-ingest` | Onde o parquet é materializado em disco (nunca inteiro na RAM) |
-| `Consumer:MaxWorkers` | 4 | Consumers concorrentes dentro do container |
 | `Consumer:MaxMessages` | 0 | Limita mensagens processadas e encerra (útil em teste) |
+| `Consumer:DlqName` | `poc-notification-dlq` | Fila de destino das mensagens que esgotam as tentativas |
+| `Consumer:VisibilityTimeoutSeconds` | 300 | Visibility timeout pedido no receive |
+| `Consumer:VisibilityHeartbeatSeconds` | 60 | De quanto em quanto tempo a visibilidade é renovada durante o processamento |
+| `Consumer:MaxReceiveCount` | 3 | Tentativas antes de mover para a DLQ |
+| `Consumer:TempRetentionHours` | 1 | Idade mínima para o worker remover um temporário órfão na inicialização |
 | `PostgreSQL:BatchSize` | 2000 | Trava de segurança do fatiamento no upsert |
 | `Metrics:Port` | 9464 | Porta do `/metrics` |
 | `DOTNET_GCHeapHardLimitPercent` | `0x4B` (75%) | Trava do heap gerenciado relativa ao limite do cgroup |
@@ -373,20 +393,43 @@ dentro do lote é normal neste volume, então a primeira ocorrência vence, de f
 
 Contagem exata de insert vs update via `RETURNING (xmax = 0)`: linha inserida tem `xmax = 0`.
 
-### Retry
+### Retry e visibility timeout (heartbeat)
 
-SQS visibility timeout.
+O visibility timeout do SQS é contado a partir da **entrega**, não do fim do processamento. Ingerir
+um arquivo grande leva minutos: com 30 s de timeout a mensagem volta para a fila **no meio da
+ingestão** — outro consumer baixa o mesmo arquivo de novo, o `ApproximateReceiveCount` sobe sem que
+nada esteja errado e a mensagem é empurrada para a **DLQ mesmo quando a ingestão ia terminar bem**.
+
+Por isso o consumer renova a visibilidade a cada `Consumer:VisibilityHeartbeatSeconds` enquanto
+processa. Medido: com `visibility=10s` (menor que os ~38 s da ingestão) a mensagem foi entregue
+**1 vez** com **6 renovações** — sem o heartbeat, seria redeliverada 3-4 vezes.
 
 ### Dead Letter Queue
 
-`custody_position_error` recebe o **payload inválido**. Atenção: o fluxo `direct` **não** tem DLQ
-configurada para mensagens que falham por erro de processamento — o worker loga, não deleta a
-mensagem e ela volta após o visibility timeout, reprocessando em loop. Ao processar um arquivo que
-estoura a memória, isso significa **re-download do arquivo a cada tentativa**.
+`custody_position_error` recebe o **payload inválido**. Para **mensagem** que falha, a DLQ é
+`poc-notification-dlq`, com duas camadas:
+
+1. **Redrive explícito no consumer** — ao atingir `Consumer:MaxReceiveCount`, a mensagem é enviada
+   à DLQ com o corpo original e atributos de triagem (`FailureReason`, `ExceptionType`,
+   `SourceQueue`, `ConsumerId`, `ReceiveCount`) e removida da fila principal.
+2. **`RedrivePolicy` do SQS** (`maxReceiveCount: 3`, criado em `scripts/setup_infra.py`) — segunda
+   linha de defesa, cobre o caso do consumer morrer sem tratar a falha.
+
+> `ApproximateReceiveCount` é **aproximado** (é o nome do atributo). Uma execução real fez 4
+> recebimentos antes do redrive com `maxReceiveCount: 3`. Por isso as duas camadas existem.
+
+#### Caso real que motivou o heartbeat
+
+Antes do fix, a DLQ acumulou 5 mensagens — e **3 delas eram do `prod_400k_20rg`, um arquivo que foi
+ingerido com sucesso** (389.417 linhas). O arquivo não tinha nada de errado: a mensagem só foi
+redeliverada enquanto a ingestão corria e o redrive nativo disparou. DLQ com falso positivo é pior
+que DLQ vazia — treina o time a ignorar o alerta.
 
 ### Paralelismo
 
-Múltiplos consumers (`--scale consumer=N`).
+Múltiplos consumers, cada um sua task (`--scale consumer=N`). Dentro do container o processamento é
+sequencial: um arquivo por vez. O `MaxWorkers` que existia no `appsettings.json` **nunca foi lido
+por nenhum código** e foi removido — paralelismo se faz por task, não por worker interno.
 
 ## Stack
 
@@ -404,8 +447,11 @@ Múltiplos consumers (`--scale consumer=N`).
 
 - **Limite mínimo viável de memória**: ~150-200 MB para este runtime. Com 128 MB o container é
   morto pelo kernel antes de processar qualquer coisa (`OOMKilled`, exit 137).
-- **`MaxWorkers > 1` multiplica o pico**: cada worker ativo segura o próprio row group. Dimensione
-  o limite como `(baseline do runtime) + (workers × row group × multiplicador)`.
+- **O paralelismo é por task, e cada task paga o próprio pico**: dimensione o limite como
+  `(baseline do runtime ~60 MB) + (row group × multiplicador)`. N tasks em paralelo = N × esse
+  valor, mas em máquinas/limites diferentes — não há memória compartilhada entre elas.
+- **Disco**: pico de 1 arquivo por container (processamento sequencial). Se `TempPath` apontar para
+  volume compartilhado (EFS, host volume no EC2), o disco passa a ser disputado entre tasks.
 - **S3 local não limita banda**: com `ministack` o download é rápido e a falha do código antigo
   ocorre em ~2 s. Em S3 real o mesmo pico aparece, só mais devagar.
 - **cadvisor em dind**: não enumera cgroups aninhados (veja Observabilidade).

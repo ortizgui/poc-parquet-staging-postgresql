@@ -64,12 +64,19 @@ services:
       DOTNET_GCHeapHardLimitPercent: "0x4B"
       Consumer__Target: direct
       Consumer__QueueName: poc-notification-queue
-      Consumer__MaxWorkers: 1
+      Consumer__DlqName: poc-notification-dlq
       Consumer__ConsumerId: dotnet-worker
+      # Ingestao de arquivo grande leva minutos e o visibility timeout conta a partir da
+      # ENTREGA: sem renovacao a mensagem volta no meio da ingestao, o trabalho duplica e o
+      # receive count infla, empurrando a mensagem para a DLQ sem erro real.
+      Consumer__VisibilityTimeoutSeconds: "300"
+      Consumer__VisibilityHeartbeatSeconds: "60"
+      Consumer__MaxReceiveCount: "3"
       # Paginacao: linhas acumuladas antes de cada flush no banco
       Consumer__FlushBatchSize: "2000"
       # Onde o parquet e materializado em disco (nunca inteiro na RAM)
       Consumer__TempPath: /tmp/poc-ingest
+      Consumer__TempRetentionHours: "1"
       PostgreSQL__BatchSize: "2000"
       Metrics__Port: "9464"
       AWS__ServiceURL: http://ministack:4566

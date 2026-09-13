@@ -8,7 +8,8 @@ namespace PocWorker.Services;
 /// Mapeamento nos 4 golden signals:
 ///   Traffic    -> poc_parquet_rows_processed_total, poc_parquet_bytes_downloaded_total
 ///   Latency    -> poc_parquet_rowgroup_read_seconds, poc_db_upsert_seconds
-///   Errors     -> poc_ingest_invalid_records_total
+///   Errors     -> poc_ingest_invalid_records_total, poc_sqs_message_failures_total,
+///                 poc_sqs_messages_sent_to_dlq_total, poc_sqs_dlq_depth
 ///   Saturation -> metricas de processo/GC do proprio prometheus-net
 ///                 + container_memory_working_set_bytes do cadvisor (nivel do pod)
 /// </summary>
@@ -41,6 +42,26 @@ public class IngestMetrics
     public Counter InvalidRecords { get; } = Metrics.CreateCounter(
         "poc_ingest_invalid_records_total",
         "Registros invalidos gravados em custody_position_error");
+
+    public Counter MessageFailures { get; } = Metrics.CreateCounter(
+        "poc_sqs_message_failures_total",
+        "Falhas de processamento de mensagem");
+
+    public Counter MessageRetries { get; } = Metrics.CreateCounter(
+        "poc_sqs_message_retries_total",
+        "Mensagens devolvidas para a fila para nova tentativa");
+
+    public Counter MessagesSentToDlq { get; } = Metrics.CreateCounter(
+        "poc_sqs_messages_sent_to_dlq_total",
+        "Mensagens movidas para a DLQ apos esgotar as tentativas");
+
+    public Gauge QueueDepth { get; } = Metrics.CreateGauge(
+        "poc_sqs_queue_depth",
+        "Mensagens na fila principal (visiveis + em voo)");
+
+    public Gauge DlqDepth { get; } = Metrics.CreateGauge(
+        "poc_sqs_dlq_depth",
+        "Mensagens na DLQ");
 
     public Histogram RowGroupReadSeconds { get; } = Metrics.CreateHistogram(
         "poc_parquet_rowgroup_read_seconds",

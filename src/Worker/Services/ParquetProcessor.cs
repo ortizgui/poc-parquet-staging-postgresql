@@ -32,6 +32,7 @@ public class ParquetProcessor
     private readonly IngestMetrics _metrics;
     private readonly ILogger<ParquetProcessor> _logger;
     private readonly string _tempPath;
+    private readonly string _tempPrefix;
     private readonly int _flushBatchSize;
 
     private const int StreamBufferSize = 1 << 16; // 64 KiB
@@ -56,6 +57,15 @@ public class ParquetProcessor
         _flushBatchSize = Math.Max(1, config.GetValue<int>("Consumer:FlushBatchSize", 2000));
 
         Directory.CreateDirectory(_tempPath);
+
+        // Um SIGKILL (OOMKilled) nao roda o finally, entao o arquivo temporario fica orfao.
+        // A limpeza roda SO na inicializacao, SO nos arquivos deste consumer (prefixo) e SO
+        // nos que passaram do tempo de retencao — seguro mesmo se TempPath apontar para um
+        // volume compartilhado entre tasks (EFS, volume de host no launch type EC2), onde
+        // apagar tudo poderia remover um arquivo que outra task esta lendo.
+        _tempPrefix = Sanitize(config.GetValue<string>("Consumer:ConsumerId") ?? "worker");
+        var retentionHours = Math.Max(1, config.GetValue<int>("Consumer:TempRetentionHours", 1));
+        CleanupStaleTempFiles(TimeSpan.FromHours(retentionHours));
     }
 
     public async Task<ProcessResult> ProcessFileAsync(
@@ -63,7 +73,7 @@ public class ParquetProcessor
     {
         var sourceFile = $"s3://{bucket}/{key}";
         var batchId = Guid.NewGuid();
-        var tempFile = Path.Combine(_tempPath, $"{batchId:N}.parquet");
+        var tempFile = Path.Combine(_tempPath, $"{_tempPrefix}-{batchId:N}.parquet");
 
         try
         {
@@ -295,6 +305,47 @@ public class ParquetProcessor
             };
         }
         return result;
+    }
+
+    private void CleanupStaleTempFiles(TimeSpan retention)
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - retention;
+            var removed = 0;
+
+            foreach (var file in Directory.EnumerateFiles(_tempPath, $"{_tempPrefix}-*.parquet"))
+            {
+                if (File.GetLastWriteTimeUtc(file) >= cutoff) continue;
+
+                try
+                {
+                    File.Delete(file);
+                    removed++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Nao foi possivel remover o temporario orfao {File}", file);
+                }
+            }
+
+            if (removed > 0)
+            {
+                _logger.LogWarning(
+                    "Removidos {N} arquivo(s) temporario(s) orfao(s), mais antigos que {H}h, de {Path}",
+                    removed, retention.TotalHours, _tempPath);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Falha ao limpar temporarios antigos em {Path}", _tempPath);
+        }
+    }
+
+    private static string Sanitize(string value)
+    {
+        var clean = new string(value.Where(c => char.IsLetterOrDigit(c) || c is '-' or '_').ToArray());
+        return clean.Length > 0 ? clean : "worker";
     }
 
     private void TryDeleteTempFile(string tempFile)
