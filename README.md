@@ -347,6 +347,16 @@ sem `container_memory_working_set_bytes` não há como comparar o consumo com o 
 
 ### 1. Setup do ambiente
 
+**Configuração (`.env`):** copie o template antes de subir a stack:
+
+```bash
+cp .env.example .env
+```
+
+O `.env` é **gitignored** (só o `.env.example` é versionado). O template usa placeholders
+**locais** do ministack/PostgreSQL; em AWS/ECS as credenciais vêm da **task role**, nunca de
+arquivo. Os knobs `CONSUMER_*` do compose e os nomes das filas estão documentados no template.
+
 ```bash
 docker compose up -d
 python3 scripts/setup_infra.py

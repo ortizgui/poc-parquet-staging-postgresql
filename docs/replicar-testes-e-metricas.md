@@ -24,6 +24,9 @@ reproduzido por outra pessoa não é prova.
 pip install -r requirements.txt
 ```
 
+> Antes de subir a stack, crie seu `.env` a partir do template `cp .env.example .env`
+> (placeholders locais de ministack/PostgreSQL; o `.env` é gitignored).
+
 > Os scripts de teste (`run_memory_test.sh`, `test_rowgroup_ab.sh`) resolvem o Python nesta ordem:
 > `$PYTHON` → `./.venv/bin/python3` (se existir) → `python3`. Por isso as dependências do
 > `requirements.txt` devem estar no `.venv` que você usa (o `.venv/` já está no `.gitignore`). O
