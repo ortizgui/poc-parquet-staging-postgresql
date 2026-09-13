@@ -82,22 +82,58 @@
       "linhas_gravadas": 197262
     },
     {
-      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
-      "arquivo": "prod_400k_20rg",
+      "codigo": "depois (.NET 10, S3Range + paginacao por row group)",
+      "arquivo": "large_1gb (1040,8 MB, 58 row groups)",
       "limite_mb": 128,
-      "resultado": "OOMKilled",
-      "detalhe": "Container morto pelo kernel (exit 137, OOMKilled=true). 128 MB nao comporta nem o runtime (.NET + AWS SDK + Npgsql + GC).",
-      "pico_mb": 0,
-      "linhas_gravadas": 0
+      "resultado": "ok",
+      "pico_mb": 108.5,
+      "linhas_gravadas": 1073909,
+      "detalhe": "CORRIGE a entrada anterior, que dizia OOMKilled. O worker processa o arquivo inteiro com pico de 108,5 MiB. O pico se ADAPTA ao limite: o GC do .NET e ciente do cgroup e coleta mais agressivo sob pressao."
     },
     {
-      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
-      "arquivo": "prod_200k_1rg",
-      "limite_mb": 128,
+      "codigo": "depois (.NET 10, S3Range + paginacao por row group)",
+      "arquivo": "large_1gb (1040,8 MB, 58 row groups)",
+      "limite_mb": 96,
+      "resultado": "ok",
+      "pico_mb": 93.6,
+      "linhas_gravadas": 1073909,
+      "detalhe": "Mesmo arquivo com pico MENOR que em 128 MB: 93,6 MiB. Confirma que o pico acompanha o limite (o GC aperta a coleta), nao o tamanho do arquivo."
+    },
+    {
+      "codigo": "depois (.NET 10, S3Range + paginacao por row group)",
+      "arquivo": "large_1gb (1040,8 MB, 58 row groups)",
+      "limite_mb": 80,
       "resultado": "OOMKilled",
-      "detalhe": "Mesmo comportamento: limite abaixo do minimo viavel do runtime. Piso real = baseline do runtime (~60 MB) + row group x multiplicador.",
-      "pico_mb": 0,
-      "linhas_gravadas": 0
+      "pico_mb": 76.1,
+      "linhas_gravadas": 247779,
+      "detalhe": "Container morto pelo kernel: OOMKilled=true, exit=137. OutOfMemoryException no log = 0 (a falha por memoria NAO gera excecao). Fronteira do piso fica entre 80 e 96 MB para este row group."
+    },
+    {
+      "codigo": "depois (.NET 10, S3Range)",
+      "arquivo": "large_1gb, varredura de STARTUP (sem processar)",
+      "limite_mb": 32,
+      "resultado": "inicia",
+      "pico_mb": 30.6,
+      "linhas_gravadas": 0,
+      "detalhe": "O worker INICIA ate com 32 MB, ocioso em ~30 MiB. Nao existe piso fixo do runtime: o que nao cabe e o PICO DE PROCESSAMENTO, que escala com o row group."
+    },
+    {
+      "codigo": "A/B decisivo — MESMO limite (192 MB), MESMO total de linhas (1.160.000)",
+      "arquivo": "ab_muitos_rg (58 row groups, 32,5 MB descomprimidos cada)",
+      "limite_mb": 192,
+      "resultado": "ok",
+      "pico_mb": 108.0,
+      "linhas_gravadas": 1073909,
+      "detalhe": "Concluiu 58/58 row groups, 0 erros, pico de ~108 MiB. Espaco de caso POSITIVO: a memoria fica chapada porque o pico manda no MAIOR ROW GROUP, nao no arquivo."
+    },
+    {
+      "codigo": "A/B decisivo — MESMO limite (192 MB), MESMO total de linhas (1.160.000)",
+      "arquivo": "ab_um_rg (1 row group, 1.8 GB descomprimidos)",
+      "limite_mb": 192,
+      "resultado": "OOMKilled",
+      "pico_mb": 189.8,
+      "linhas_gravadas": 0,
+      "detalhe": "ESTE e o caso de falha que faltava. Mesmo limite, mesmo volume de dados, 1 row group -> OOMKilled (exit 137, sem excecao no log). Prova que o row group e a unidade que define o pico. Teste reproduzivel: scripts/test_rowgroup_ab.sh (com asercao, exit != 0 se nao bater)."
     }
   ],
   "idempotencia": {
@@ -156,8 +192,9 @@
     "armadilha": "Alinhar a busca do Range em blocos de 8 MB transferiria ~18x mais bytes que o necessario neste layout (column chunk ~450 KB), podendo passar do tamanho do arquivo inteiro. A busca e exata, com piso de 256 KB e teto configuravel."
   },
   "conclusao": {
-    "formula": "pico ~= 60 MB (baseline do runtime) + bytes descomprimidos DAS COLUNAS LIDAS no maior row group x 2 a 4",
-    "regra": "O tamanho do ARQUIVO nao define o pico; o que define e (row group x colunas lidas). Por isso o row_group_size e decisao de quem ESCREVE o parquet — e a projecao de colunas e o ganho mais barato num schema largo.",
-    "evidencia_chave": "O arquivo de 358.9 MB (20 row groups) passou com pico de 95 MiB onde o de 179.5 MB (arquivo menor, mas com o codigo antigo) falhou com 226 MiB."
+    "formula": "pico ~= overhead do runtime (~30 MiB ocioso) + bytes descomprimidos DAS COLUNAS PROJETADAS no maior row group + lote de flush",
+    "regra": "O tamanho do ARQUIVO nao define o pico. O que define e (maior row group x colunas lidas). Um unico row group gigante NAO tem como ser paginado pelo leitor — o piso vira o proprio row group. Por isso row_group_size e decisao de quem ESCREVE o parquet, e a projecao de colunas e o ganho mais barato num schema largo.",
+    "evidencia_chave": "A/B com mesmo limite (192 MB) e mesmo volume (1,16M linhas): 58 row groups concluem com pico de ~108 MiB; 1 row group de 1,8 GB estoura (OOMKilled, 189,8 MiB sem concluir). Teste versionado e com asercao em scripts/test_rowgroup_ab.sh.",
+    "correcao_2026_09_13": "Duas entradas anteriores afirmavam 128 MB -> OOMKilled com pico 0. A medicao refeita mostra 128 MB passando com pico de 108,5 MiB. Removidas. A afirmacao de 'piso do runtime ~150-200 MB' tambem estava errada: o worker inicia ate com 32 MB."
   }
 }
