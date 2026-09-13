@@ -456,3 +456,58 @@ implementa a mesma semântica de Range. A diferença é **latência e IAM**, nã
   por vez. Paralelizar row groups exigiria múltiplos streams — possível, fora do escopo da POC.
 - **Many small files:** o modelo é 1 mensagem = 1 arquivo grande. Para muitos arquivos pequenos, o
   custo de 120 GETs não aparece, mas o de abrir conexão por arquivo sim — aí vale batch.
+
+---
+
+## 15. Referências — documentação oficial
+
+A leitura parcial não é um truque: é a **composição de quatro coisas que a AWS documenta e que a
+própria AWS usa**. Cada tabela diz o que a fonte prova.
+
+### Camada 1 — o S3 suporta leitura parcial (documentado pela AWS)
+
+| Fonte | O que prova |
+|---|---|
+| [S3 API Reference — `GetObject`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html) | O header **`Range`** é parâmetro oficial: *"Downloads the specified byte range of an object."* A resposta traz **`Content-Range`** e `accept-ranges`, e o exemplo de resposta é **`HTTP/1.1 206 Partial Content`**. Também documenta o **`If-Match`** usado no pinning de ETag. **Limitação relevante:** *"Amazon S3 doesn't support retrieving multiple ranges of data per GET request"* — é por isso que cada column chunk vira uma requisição (as 120 do trace de §3.3). |
+| [S3 User Guide — Downloading objects](https://docs.aws.amazon.com/AmazonS3/latest/userguide/download-objects.html) | Recomenda *"concurrent GetObject requests with either **Range HTTP header** to read specific byte ranges or partNumber"* — leitura por faixa é o caminho oficial para objetos grandes. |
+| [S3 User Guide — Working with Range and partNumber headers](https://docs.aws.amazon.com/AmazonS3/latest/userguide/range-get-olap.html) | Semântica de `Range`/`partNumber` pela AWS. |
+| [AWS SDK for .NET — `GetObjectRequest.ByteRange`](https://docs.aws.amazon.com/sdkfornet/v3/apidocs/items/S3/TGetObjectRequest.html) | O SDK que usamos expõe a faixa de bytes como propriedade de primeira classe: *"Downloads the specified range bytes of an object."* |
+
+### Camada 2 — o cliente de arquivos oficial da AWS faz exatamente isso
+
+| Fonte | O que prova |
+|---|---|
+| [Mountpoint for Amazon S3 — `doc/SEMANTICS.md`](https://github.com/awslabs/mountpoint-s3/blob/main/doc/SEMANTICS.md) | Cliente de arquivos **oficial da AWS** (awslabs). Documenta *"Mountpoint also supports **random reads** from an existing object, including **seeking in an open file**"*. |
+| [`mountpoint-s3-client` — código-fonte](https://github.com/awslabs/mountpoint-s3) | O cliente monta os GETs com `GetObjectParams::new().range(...)` e `if_match` — **os mesmos dois mecanismos** que o `S3RangeStream` usa (Range GET + pinning por ETag). |
+
+### Camada 3 — o Parquet é **projetado** para ser lido assim
+
+| Fonte | O que prova |
+|---|---|
+| [Apache Parquet — especificação do formato](https://github.com/apache/parquet-format/blob/master/README.md) | O layout termina com `File Metadata` + `4-byte length` + `PAR1`, e o texto é explícito: *"**Readers are expected to first read the file metadata** to find all the column chunks they are interested in. The column chunks should then be read sequentially."* A mesma página define a hierarquia: *"Unit of parallelization — MapReduce: File/Row Group; IO: Column chunk; Encoding/Compression: Page"*. |
+
+### Camada 4 — os serviços analíticos da AWS operam nessa granularidade
+
+| Fonte | O que prova |
+|---|---|
+| [Amazon Athena — Use columnar storage formats](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) | *"Predicate pushdown in Parquet and ORC enables Athena queries to **fetch only the blocks it needs**"*. |
+| [AWS Big Data Blog — Top 10 Performance Tuning Tips for Amazon Athena](https://aws.amazon.com/blogs/big-data/top-10-performance-tuning-tips-for-amazon-athena/) | Define split como *"a **byte range** of an uncompressed text file, or a **page of a Parquet file**"* e afirma que *"Analytics-optimized formats like Parquet and ORC are **always splittable**"*. |
+| [AWS Glue — Using the Parquet format](https://docs.aws.amazon.com/glue/latest/dg/aws-glue-programming-etl-format-parquet-home.html) | `blockSize`: *"Specifies the size in bytes of a **row group** being buffered in memory"* (default 128 MB). |
+| [Amazon S3 Select — Querying data in place](https://docs.aws.amazon.com/AmazonS3/latest/userguide/selecting-content-from-objects.html) | *"The maximum uncompressed **row group** size is 512 MB"* e descreve consultas sobre **scan ranges** (faixas de bytes). |
+
+### O limite honesto desta evidência
+
+A AWS **não publica** uma página única dizendo *"leia o footer do Parquet com um Range GET e itere os
+row groups"*. O que existe é cada peça documentada separadamente:
+
+1. o S3 **suporta** Range GET e devolve `206 Partial Content`;
+2. o cliente de arquivos **oficial da AWS** faz `seek` → `range` GET;
+3. a **especificação do Parquet** manda o leitor ler o metadata primeiro;
+4. os serviços analíticos da AWS **operam nessa granularidade** (predicate pushdown, splits, row groups).
+
+A composição das quatro é a POC. O que a POC acrescenta é a **prova de execução** — o trace de
+requisições (§3.3) e as medições (§5) — não a invenção de um padrão.
+
+> **Detalhe de produção:** Range é aplicado sobre os **bytes finais do objeto**, independentemente de
+> como ele foi carregado. Um objeto subido por multipart upload é lido por Range normalmente — as
+> faixas não têm relação com as partes do upload.
