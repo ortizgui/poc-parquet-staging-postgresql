@@ -1,0 +1,212 @@
+{
+  "descricao": "Resultados medidos do teste de paginacao/memoria da ingestao Parquet -> PostgreSQL",
+  "medido_em": "2026-09-13",
+  "ambiente": {
+    "runtime": ".NET 10.0.12 (LTS) / SDK 10.0.401",
+    "host": "Linux aarch64, 8 vCPU, 7.4 GB RAM",
+    "s3_sqs": "ministack 1.5.11 (local — o download nao e limitado por rede, entao a falha do baseline e rapida)",
+    "limite_do_pod": "512 MB (mem_limit + memswap_limit, sem swap)",
+    "gc": "DOTNET_gcServer=0, DOTNET_GCHeapHardLimitPercent=0x4B (75% do cgroup = ~384 MB de heap gerenciado)",
+    "observacao": "S3 local faz o baseline falhar em ~2s; em S3 real o download e mais lento e a curva sobe mais devagar, mas o pico e o mesmo."
+  },
+  "arquivos_de_teste": [
+    {
+      "nome": "prod_200k_1rg",
+      "rows": 200000,
+      "colunas": 40,
+      "disco_mb": 167.9,
+      "row_groups": 1,
+      "maior_row_group_mb": 312.7
+    },
+    {
+      "nome": "prod_200k_10rg",
+      "rows": 200000,
+      "colunas": 40,
+      "disco_mb": 179.5,
+      "row_groups": 10,
+      "maior_row_group_mb": 32.5
+    },
+    {
+      "nome": "prod_400k_20rg",
+      "rows": 400000,
+      "colunas": 40,
+      "disco_mb": 358.9,
+      "row_groups": 20,
+      "maior_row_group_mb": 32.5
+    }
+  ],
+  "resultados": [
+    {
+      "codigo": "antes (.NET 10, MemoryStream + acumula arquivo inteiro)",
+      "arquivo": "prod_200k_10rg",
+      "limite_mb": 512,
+      "resultado": "nao-deterministico",
+      "detalhe": "1a rodada: concluiu com pico de 363.4 MiB (71% do limite) — +197324 ins ~2676 upd. 2a rodada, MESMO arquivo e mesmo limite: OutOfMemoryException, 0 linhas, pico 226.4 MiB.",
+      "pico_mb": 363.4,
+      "linhas_gravadas": 197324
+    },
+    {
+      "codigo": "antes (.NET 10, MemoryStream + acumula arquivo inteiro)",
+      "arquivo": "prod_200k_1rg",
+      "limite_mb": 512,
+      "resultado": "falhou",
+      "detalhe": "System.OutOfMemoryException em ParquetProcessor.cs:37 (MemoryStream.set_Capacity), durante o download. 0 linhas.",
+      "pico_mb": 226.6,
+      "linhas_gravadas": 0
+    },
+    {
+      "codigo": "antes (.NET 10, MemoryStream + acumula arquivo inteiro)",
+      "arquivo": "prod_400k_20rg",
+      "limite_mb": 512,
+      "resultado": "falhou",
+      "detalhe": "System.OutOfMemoryException, 0 linhas. A mensagem volta para a fila e reprocessa em loop (sem DLQ no fluxo direct).",
+      "pico_mb": 233.5,
+      "linhas_gravadas": 0
+    },
+    {
+      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
+      "arquivo": "prod_400k_20rg",
+      "limite_mb": 512,
+      "resultado": "ok",
+      "detalhe": "Arquivo 2.1x MAIOR que o do baseline, com 4x menos memoria. +389417 ins ~10521 upd -0 err / 400000 linhas lidas. Heap gerenciado ficou entre 12 e 32 MB durante todo o processamento.",
+      "pico_mb": 95.4,
+      "linhas_gravadas": 389417
+    },
+    {
+      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
+      "arquivo": "prod_200k_1rg",
+      "limite_mb": 512,
+      "resultado": "ok",
+      "detalhe": "Um unico row group de 312.7 MB descomprimidos. Passa porque a projecao de colunas le 5 de 40 colunas: o custo e das colunas lidas, nao do row group inteiro.",
+      "pico_mb": 149.3,
+      "linhas_gravadas": 197262
+    },
+    {
+      "codigo": "depois (.NET 10, S3Range + paginacao por row group)",
+      "arquivo": "large_1gb (1040,8 MB, 58 row groups)",
+      "limite_mb": 128,
+      "resultado": "ok",
+      "pico_mb": 108.5,
+      "linhas_gravadas": 1073909,
+      "detalhe": "CORRIGE a entrada anterior, que dizia OOMKilled. O worker processa o arquivo inteiro com pico de 108,5 MiB. O pico se ADAPTA ao limite: o GC do .NET e ciente do cgroup e coleta mais agressivo sob pressao."
+    },
+    {
+      "codigo": "depois (.NET 10, S3Range + paginacao por row group)",
+      "arquivo": "large_1gb (1040,8 MB, 58 row groups)",
+      "limite_mb": 96,
+      "resultado": "ok",
+      "pico_mb": 93.6,
+      "linhas_gravadas": 1073909,
+      "detalhe": "Mesmo arquivo com pico MENOR que em 128 MB: 93,6 MiB. Confirma que o pico acompanha o limite (o GC aperta a coleta), nao o tamanho do arquivo."
+    },
+    {
+      "codigo": "depois (.NET 10, S3Range + paginacao por row group)",
+      "arquivo": "large_1gb (1040,8 MB, 58 row groups)",
+      "limite_mb": 80,
+      "resultado": "OOMKilled",
+      "pico_mb": 76.1,
+      "linhas_gravadas": 247779,
+      "detalhe": "Container morto pelo kernel: OOMKilled=true, exit=137. OutOfMemoryException no log = 0 (a falha por memoria NAO gera excecao). Fronteira do piso fica entre 80 e 96 MB para este row group."
+    },
+    {
+      "codigo": "depois (.NET 10, S3Range)",
+      "arquivo": "large_1gb, varredura de STARTUP (sem processar)",
+      "limite_mb": 32,
+      "resultado": "inicia",
+      "pico_mb": 30.6,
+      "linhas_gravadas": 0,
+      "detalhe": "O worker INICIA ate com 32 MB, ocioso em ~30 MiB. Nao existe piso fixo do runtime: o que nao cabe e o PICO DE PROCESSAMENTO, que escala com o row group."
+    },
+    {
+      "codigo": "A/B decisivo — MESMO limite (192 MB), MESMO total de linhas (1.160.000)",
+      "arquivo": "ab_muitos_rg (58 row groups, 32,5 MB descomprimidos cada)",
+      "limite_mb": 192,
+      "resultado": "ok",
+      "pico_mb": 109.4,
+      "linhas_gravadas": 1073909,
+      "detalhe": "Concluiu 58/58 row groups, 0 erros, pico de ~109,4 MiB. Espaco de caso POSITIVO: a memoria fica chapada porque o pico manda no MAIOR ROW GROUP, nao no arquivo.",
+      "fonte": "docs/evidencias/ (run final 20260913_132022, ab-limit192-final.log)"
+    },
+    {
+      "codigo": "A/B decisivo — MESMO limite (192 MB), MESMO total de linhas (1.160.000)",
+      "arquivo": "ab_um_rg (1 row group, 1.8 GB descomprimidos)",
+      "limite_mb": 192,
+      "resultado": "falha_memoria",
+      "modo_de_falha": "Depende do heap hard limit: o kernel pode matar o container (OOMKilled, exit 137, SEM excecao no log) OU o runtime pode lancar System.OutOfMemoryException ANTES do cgroup matar (nesse caso OOMKilled=false, exit 0). Os dois modos provam o mesmo piso (maior row group x colunas lidas).",
+      "medicao_2026_09_13": {
+        "ambiente": "Docker Desktop local, .NET 10.0.12, mem_limit=192m, DOTNET_GCHeapHardLimitPercent=0x4B",
+        "modo_observado": "System.OutOfMemoryException gerenciada em ParquetProcessor.cs:262 (Parquet.Schema.DataField.UnpackDefinitions)",
+        "OOMKilled": false,
+        "exit": 0,
+        "pico_mib": 176.9,
+        "linhas_gravadas": 0
+      },
+      "pico_mb": 176.9,
+      "linhas_gravadas": 0,
+      "detalhe": "ESTE e o caso de falha que faltava. Mesmo limite, mesmo volume de dados, 1 row group -> falha por memoria. Prova que o row group e a unidade que define o pico. No run final (20260913_132022) o modo observado foi a falha GERENCIADA: System.OutOfMemoryException em ParquetProcessor.cs:262 (Parquet.Schema.DataField.UnpackDefinitions), OOMKilled=false, exit 0, 0 linhas gravadas. O outro modo possivel e o kernel matar o container (OOMKilled=true, exit 137, sem excecao no log); ambos provam o mesmo piso. Teste reproduzivel: scripts/test_rowgroup_ab.sh (com asercao; aceita OS DOIS modos de falha por memoria e rejeita timeout/DLQ).",
+      "fonte": "docs/evidencias/ (run final 20260913_132022, ab-limit192-final.log)"
+    }
+  ],
+  "idempotencia": {
+    "cenario": "reprocessar prod_200k_1rg com a tabela ja populada (sem truncar)",
+    "resultado": "+0 ins ~5395 upd, contagem estavel em 197262 linhas",
+    "leitura": "Estado final e idempotente: nao insere de novo e a contagem nao muda. Os UPDATEs sao churn de chaves duplicadas DENTRO do arquivo cruzando lotes (a primeira ocorrencia vence por lote). Zero update so com dado sem duplicata de chave — o repo ja tem scripts/generate_unique_test_data.py para isso."
+  },
+  "resiliencia": {
+    "medido_em": "2026-09-13 (follow-up: DLQ + heartbeat)",
+    "falso_positivo_na_dlq": {
+      "sintoma": "A DLQ acumulou 5 mensagens, sendo 3 do arquivo prod_400k_20rg — que foi ingerido com sucesso (389.417 linhas).",
+      "causa": "VisibilityTimeout de 30s menor que o tempo de ingestao (~38s): a mensagem era redeliverada NO MEIO do processamento e o redrive nativo (maxReceiveCount=3) disparava sem nenhum erro real.",
+      "evidencia": [
+        "input/probe.parquet",
+        "input/prod_200k_1rg.parquet",
+        "input/prod_400k_20rg.parquet (3 copias)"
+      ]
+    },
+    "heartbeat_de_visibility": {
+      "cenario": "visibility=10s (menor que os ~38s da ingestao), heartbeat=5s",
+      "resultado": "1 entrega da mensagem, 6 renovacoes de visibility, ingestao completa (389.417 linhas), DLQ em 0, pico de 88 MiB",
+      "sem_heartbeat": "3-4 redeliveries — era o comportamento observado antes do fix"
+    },
+    "dlq_com_atributos_de_triagem": {
+      "cenario": "arquivo invalido (texto com extensao .parquet), maxReceiveCount=3, visibility=10s",
+      "resultado": "3 tentativas, 4 recebimentos (ApproximateReceiveCount e aproximado) e a mensagem movida para a DLQ",
+      "atributos": {
+        "FailureReason": "not a parquet file, head: 6973746F, tail: 71756574",
+        "ExceptionType": "IOException",
+        "SourceQueue": "poc-notification-queue",
+        "ConsumerId": "dotnet-worker",
+        "ReceiveCount": "3"
+      }
+    },
+    "nota": "A DLQ e o RedrivePolicy JA existiam em scripts/setup_infra.py (maxReceiveCount=3). O defeito real era o visibility timeout curto, que gerava falso positivo na DLQ — pior que DLQ vazia, porque treina o time a ignorar o alerta."
+  },
+  "modos_de_leitura": {
+    "medido_em": "2026-09-13 (follow-up: Range GET)",
+    "arquivo": "prod_400k_20rg (358.9 MB, 20 row groups, 40 colunas — 5 lidas)",
+    "limite_mb": 512,
+    "S3Range": {
+      "linhas": 389417,
+      "pico_mib": 104,
+      "bytes_transferidos": 10882646,
+      "requests": 44,
+      "percentual_do_objeto": 2.9
+    },
+    "LocalFile": {
+      "linhas": 389417,
+      "pico_mib": 91,
+      "bytes_transferidos": 376372808,
+      "requests": 1,
+      "percentual_do_objeto": 100.0
+    },
+    "leitura": "Mesmo resultado nos dois modos. O S3Range transferiu 34x menos porque le so os column chunks das colunas projetadas — e as colunas nao lidas sao as de texto largo/alta cardinalidade, que dominam o tamanho do arquivo. Nada vai para disco.",
+    "armadilha": "Alinhar a busca do Range em blocos de 8 MB transferiria ~18x mais bytes que o necessario neste layout (column chunk ~450 KB), podendo passar do tamanho do arquivo inteiro. A busca e exata, com piso de 256 KB e teto configuravel."
+  },
+  "conclusao": {
+    "formula": "pico ~= overhead do runtime (~30 MiB ocioso) + bytes descomprimidos DAS COLUNAS PROJETADAS no maior row group + lote de flush",
+    "regra": "O tamanho do ARQUIVO nao define o pico. O que define e (maior row group x colunas lidas). Um unico row group gigante NAO tem como ser paginado pelo leitor — o piso vira o proprio row group. Por isso row_group_size e decisao de quem ESCREVE o parquet, e a projecao de colunas e o ganho mais barato num schema largo.",
+    "evidencia_chave": "A/B com mesmo limite (192 MB) e mesmo volume (1,16M linhas): 58 row groups concluem com pico de ~109,4 MiB; 1 row group de 1,8 GB falha por memoria sem concluir. O modo de falha varia com o heap hard limit: OOMKilled do kernel (exit 137, sem excecao) OU System.OutOfMemoryException gerenciada (OOMKilled=false, exit 0). No run final (20260913_132022, Docker Desktop, 192m, GCHeapHardLimitPercent=0x4B) o modo observado foi o GERENCIADO: System.OutOfMemoryException em ParquetProcessor.cs:262 (Parquet.Schema.DataField.UnpackDefinitions), OOMKilled=false, exit 0, pico ~176,9 MiB, 0 linhas; o outro modo possivel e o kernel matar o container (OOMKilled=true, exit 137). Teste versionado e com asercao em scripts/test_rowgroup_ab.sh (aceita OS DOIS modos). Evidencia bruta em docs/evidencias/.",
+    "modo_de_falha": "A deteccao NAO pode contar com um unico modo: (1) o OOMKilled do kernel/cgroup aparece como OOMKilled=true (cadvisor / stop reason da task ECS); (2) um OOM GERENCIADO deixa OOMKilled=false e so aparece como System.OutOfMemoryException no log do worker, seguido (ou nao) de DLQ. Por isso o teste e a operacao devem alertar sobre OS DOIS: OOMKilled/stop reason da task E profundidade da DLQ + excecao no log. Medir so o heap gerenciado da falso negativo; medir so o OOMKilled perde o modo gerenciado.",
+    "correcao_2026_09_13": "Duas entradas anteriores afirmavam 128 MB -> OOMKilled com pico 0. A medicao refeita mostra 128 MB passando com pico de 108,5 MiB. Removidas. A afirmacao de 'piso do runtime ~150-200 MB' tambem estava errada: o worker inicia ate com 32 MB."
+  }
+}

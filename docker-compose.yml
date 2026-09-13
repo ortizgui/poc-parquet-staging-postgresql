@@ -17,35 +17,91 @@ services:
       timeout: 5s
       retries: 5
 
+  # Emulador AWS local.
+  # ATENCAO: localstack/localstack:latest passou a exigir LOCALSTACK_AUTH_TOKEN
+  # (sai com codigo 55/ license activation failed) — trocamos pelo ministack,
+  # que e free, MIT e drop-in na mesma porta 4566.
   ministack:
-    image: localstack/localstack:latest
+    image: ministackorg/ministack:latest
     container_name: poc-ministack
     environment:
-      SERVICES: s3,sqs,sns
+      GATEWAY_PORT: "4566"
+      LOG_LEVEL: INFO
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
     ports:
       - "4566:4566"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
+      # a imagem do ministack nao tem curl/wget — usa o python que ja vem nela
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4566/health', timeout=5).status==200 else 1)\""]
       interval: 5s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 20
+      start_period: 15s
 
-  # Consumer: consome eventos S3 da SQS e faz bulk insert direto na custody_position
+  # Consumer: consome eventos S3 da SQS e faz bulk insert direto na custody_position.
   # Para escalar: docker compose up -d --scale consumer=3
+  #
+  # MEMORIA: e o eixo do teste de paginacao. O limite abaixo e o que prova que o
+  # worker le um arquivo maior que a propria RAM sem estourar.
   consumer:
     build:
       context: .
       dockerfile: src/Worker/Dockerfile
     container_name: poc-consumer
+    # O limite e o eixo do teste: escolha por env sem editar arquivo.
+    #   CONSUMER_MEM_LIMIT=128m  -> 128MB ainda PASSA (pico 108,5 MiB); 80m morre por memoria
+    #   CONSUMER_MEM_LIMIT=512m -> default; arquivo de 1GB (2x o limite) passa
+    #   CONSUMER_MEM_LIMIT=1g    -> comparativo com mais folga
+    # memswap IGUAL ao limite de proposito: com swap disponivel o container sobrevive
+    # a pressao de memoria e o teste mente — o ponto e nao ter para onde crescer.
+    mem_limit: ${CONSUMER_MEM_LIMIT:-512m}
+    memswap_limit: ${CONSUMER_MEM_LIMIT:-512m}
+    deploy:
+      resources:
+        limits:
+          memory: ${CONSUMER_MEM_LIMIT:-512m}
     environment:
       DOTNET_ENVIRONMENT: Production
+      # GC: o runtime ja detecta o limite do cgroup e trava o heap em ~75%.
+      # Explicitar deixa o teste reproduzivel entre ambientes.
+      DOTNET_gcServer: "0"
+      DOTNET_GCHeapHardLimitPercent: "0x4B"
       Consumer__Target: direct
       Consumer__QueueName: poc-notification-queue
-      Consumer__MaxWorkers: 4
+      Consumer__DlqName: poc-notification-dlq
       Consumer__ConsumerId: dotnet-worker
+      # Ingestao de arquivo grande leva minutos e o visibility timeout conta a partir da
+      # ENTREGA: sem renovacao a mensagem volta no meio da ingestao, o trabalho duplica e o
+      # receive count infla, empurrando a mensagem para a DLQ sem erro real.
+      # Heartbeat de visibility: renova a cada N s enquanto a ingestao roda. TEM que ser bem
+      # menor que o VisibilityTimeoutSeconds (senao a mensagem reaparece antes da renovacao).
+      # O worker deriva o valor do timeout quando nao vem configurado, e nunca aceita um
+      # heartbeat >= timeout. 15s da margem de 20x sobre os 300s.
+      Consumer__VisibilityTimeoutSeconds: "300"
+      Consumer__VisibilityHeartbeatSeconds: "15"
+      Consumer__MaxReceiveCount: "3"
+      # Modo de leitura do Parquet no S3:
+      #   S3Range   -> stream seekable sobre Range GET: le o footer e busca so os bytes
+      #                necessarios. Sem disco. Com projecao de colunas, transfere so a fracao
+      #                das colunas lidas (ex.: 5 de 40).
+      #   LocalFile -> baixa o objeto para arquivo temporario e le local. 1 requisicao grande,
+      #                exige disco do tamanho do objeto.
+      Consumer__ReadMode: ${CONSUMER_READ_MODE:-S3Range}
+      Consumer__RangeBlockMb: "8"
+      # Pinning: envia If-Match com o ETag do objeto em toda requisicao Range. Se o arquivo for
+      # sobrescrito durante a leitura, o S3 devolve 412 em vez de misturar bytes de duas versoes.
+      Consumer__PinObjectVersion: "${CONSUMER_PIN_OBJECT_VERSION:-true}"
+      # Loga cada Range GET (offset/tamanho). Use para provar a sequencia de leitura; ruidoso.
+      Consumer__RangeTraceLog: "${CONSUMER_RANGE_TRACE_LOG:-false}"
+      # Paginacao: linhas acumuladas antes de cada flush no banco
+      Consumer__FlushBatchSize: "2000"
+      # Usado apenas no modo LocalFile
+      Consumer__TempPath: /tmp/poc-ingest
+      Consumer__TempRetentionHours: "1"
+      PostgreSQL__BatchSize: "2000"
+      Metrics__Port: "9464"
       AWS__ServiceURL: http://ministack:4566
       AWS__Region: us-east-1
       AWS__AccessKey: test
@@ -54,11 +110,60 @@ services:
       PostgreSQL__Database: pocdb
       PostgreSQL__Username: pocuser
       PostgreSQL__Password: pocpass
+    ports:
+      - "9464:9464"
     depends_on:
       postgres:
         condition: service_healthy
       ministack:
         condition: service_healthy
 
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: poc-prometheus
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - consumer
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: poc-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  # Metricas de container (o golden signal de saturations e do POD, nao do processo)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: poc-cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      - consumer
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:

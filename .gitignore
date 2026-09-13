@@ -8,22 +8,26 @@ venv/
 
 # Environment
 .env
+.env.*
+!.env.example
 
 # IDE
 .vscode/
 .idea/
 
-# Data
-data/input/*.parquet
+# Data (parquet gerado pelo gerador/A-B — nunca versionado)
+data/*.parquet
+data/**/*.parquet
 
 # OS
 .DS_Store
 
-# Images
-
+# Imagens
 *.png
 *.csv
 *.html
+# ...exceto as evidencias versionadas da documentacao
+!docs/assets/*.png
 # Simulation reports
 reports/
 
@@ -37,3 +41,13 @@ scripts/process_file.py
 scripts/merge_staging.py
 scripts/simulate_load.py
 run_simulation.sh
+
+# Harness local de validacao (bind mount nao atravessa dind)
+harness/
+!docs/assets/*.csv
+
+# Evidencias versionadas do A/B (o *.csv/*.png global ignoraria)
+!docs/evidencias/*.csv
+!docs/evidencias/*.png
+!docs/evidencias/*.log
+!docs/evidencias/*.txt

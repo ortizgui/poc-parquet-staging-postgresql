@@ -1,0 +1,23 @@
+[13:20:22] garantindo o bucket s3://poc-bucket
+[13:20:23] reusando os arquivos existentes (--reuse)
+[13:20:23]   subindo os arquivos existentes para o S3
+[13:20:58] cenario MUITOS_RG (input/ab_1160000_20000rg.parquet) @ 192m
+[NOTIFICATION] S3 Event published directly to SQS
+  Queue Name: poc-notification-queue
+  Queue URL:  http://localhost:4566/000000000000/poc-notification-queue
+  Bucket:     poc-bucket
+  Key:        input/ab_1160000_20000rg.parquet
+[13:22:39]   -> ok | pico 109.4 MiB | 1073909 linhas | OutOfMemoryException no log: 0
+[13:22:39] cenario UM_RG (input/ab_1160000_1rg.parquet) @ 192m
+[NOTIFICATION] S3 Event published directly to SQS
+  Queue Name: poc-notification-queue
+  Queue URL:  http://localhost:4566/000000000000/poc-notification-queue
+  Bucket:     poc-bucket
+  Key:        input/ab_1160000_1rg.parquet
+[13:24:03]   -> out_of_memory | pico 176.9 MiB | 0 linhas | OutOfMemoryException no log: 1
+[13:24:03] ==================== VEREDITO (limite 192m) ====================
+[13:24:03]   MUITOS_RG : ok (pico 109.4 MiB)
+[13:24:03]   UM_RG     : out_of_memory (pico 176.9 MiB)
+[13:24:03]   PASS: mesmo limite e mesmo tamanho de arquivo — varios row groups concluem,
+[13:24:03]         um row group unico estoura. A paginacao por row group esta demonstrada.
+[13:24:03] log : reports/rowgroup_ab_20260913_132022.log
