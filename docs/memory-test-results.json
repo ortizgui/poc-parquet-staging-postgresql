@@ -134,6 +134,27 @@
     },
     "nota": "A DLQ e o RedrivePolicy JA existiam em scripts/setup_infra.py (maxReceiveCount=3). O defeito real era o visibility timeout curto, que gerava falso positivo na DLQ — pior que DLQ vazia, porque treina o time a ignorar o alerta."
   },
+  "modos_de_leitura": {
+    "medido_em": "2026-09-13 (follow-up: Range GET)",
+    "arquivo": "prod_400k_20rg (358.9 MB, 20 row groups, 40 colunas — 5 lidas)",
+    "limite_mb": 512,
+    "S3Range": {
+      "linhas": 389417,
+      "pico_mib": 104,
+      "bytes_transferidos": 10882646,
+      "requests": 44,
+      "percentual_do_objeto": 2.9
+    },
+    "LocalFile": {
+      "linhas": 389417,
+      "pico_mib": 91,
+      "bytes_transferidos": 376372808,
+      "requests": 1,
+      "percentual_do_objeto": 100.0
+    },
+    "leitura": "Mesmo resultado nos dois modos. O S3Range transferiu 34x menos porque le so os column chunks das colunas projetadas — e as colunas nao lidas sao as de texto largo/alta cardinalidade, que dominam o tamanho do arquivo. Nada vai para disco.",
+    "armadilha": "Alinhar a busca do Range em blocos de 8 MB transferiria ~18x mais bytes que o necessario neste layout (column chunk ~450 KB), podendo passar do tamanho do arquivo inteiro. A busca e exata, com piso de 256 KB e teto configuravel."
+  },
   "conclusao": {
     "formula": "pico ~= 60 MB (baseline do runtime) + bytes descomprimidos DAS COLUNAS LIDAS no maior row group x 2 a 4",
     "regra": "O tamanho do ARQUIVO nao define o pico; o que define e (row group x colunas lidas). Por isso o row_group_size e decisao de quem ESCREVE o parquet — e a projecao de colunas e o ganho mais barato num schema largo.",

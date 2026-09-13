@@ -13,20 +13,29 @@ namespace PocWorker.Services;
 /// Le um Parquet do S3 e faz upsert direto em custody_position.
 ///
 /// Paginacao por ROW GROUP:
-///   1. baixa o objeto do S3 por streaming para arquivo temporario (RAM constante);
-///   2. abre o arquivo (stream seekable, contrato do Parquet.Net);
-///   3. le row group a row group, fatiando cada um em lotes de FlushBatchSize;
-///   4. faz flush no banco e descarta o lote antes de seguir.
+///   1. obtem um stream seekable do objeto (dois modos, ver <c>Consumer:ReadMode</c>);
+///   2. le row group a row group, fatiando cada um em lotes de FlushBatchSize;
+///   3. faz flush no banco e descarta o lote antes de seguir.
 ///
 /// A memoria de pico e O(maior row group + lote de flush) — NAO O(tamanho do arquivo).
 /// O row group e a unidade de I/O do Parquet, e quem o define e o WRITER
 /// (row_group_size). Um arquivo com um unico row group gigante nao tem como ser
-/// paginado pelo leitor: o piso e o proprio row group.
+/// paginado pelo leitor: o piso e o proprio row group (atenuado pela projecao de colunas).
 ///
-/// Projecao: apenas as colunas que alimentam custody_position sao lidas do arquivo.
+/// Projecao: apenas as colunas que alimentam custody_position sao lidas do stream.
+///
+/// MODOS DE LEITURA (Consumer:ReadMode):
+///   S3Range  — stream seekable sobre Range GET (default). Le o footer e busca so os bytes
+///              necessarios; nada vai para disco e, com projecao, a transferencia cai para a
+///              fracao de colunas lidas. Mais requisicoes HTTP.
+///   LocalFile — baixa o objeto por streaming para um arquivo temporario e le o arquivo local.
+///              1 requisicao grande, leitura local; exige espaco em disco do tamanho do objeto.
 /// </summary>
 public class ParquetProcessor
 {
+    public const string ReadModeS3Range = "S3Range";
+    public const string ReadModeLocalFile = "LocalFile";
+
     private readonly IAmazonS3 _s3;
     private readonly DatabaseService _db;
     private readonly IngestMetrics _metrics;
@@ -34,8 +43,12 @@ public class ParquetProcessor
     private readonly string _tempPath;
     private readonly string _tempPrefix;
     private readonly int _flushBatchSize;
+    private readonly string _readMode;
+    private readonly int _rangeBlockBytes;
 
     private const int StreamBufferSize = 1 << 16; // 64 KiB
+
+    private bool UseS3Range => !string.Equals(_readMode, ReadModeLocalFile, StringComparison.OrdinalIgnoreCase);
 
     public ParquetProcessor(
         IAmazonS3 s3,
@@ -55,14 +68,16 @@ public class ParquetProcessor
             : configuredTemp;
 
         _flushBatchSize = Math.Max(1, config.GetValue<int>("Consumer:FlushBatchSize", 2000));
+        _readMode = config.GetValue<string>("Consumer:ReadMode") ?? ReadModeS3Range;
+        _rangeBlockBytes = Math.Max(1, config.GetValue<int>("Consumer:RangeBlockMb", 8)) * 1024 * 1024;
 
         Directory.CreateDirectory(_tempPath);
 
         // Um SIGKILL (OOMKilled) nao roda o finally, entao o arquivo temporario fica orfao.
-        // A limpeza roda SO na inicializacao, SO nos arquivos deste consumer (prefixo) e SO
-        // nos que passaram do tempo de retencao — seguro mesmo se TempPath apontar para um
-        // volume compartilhado entre tasks (EFS, volume de host no launch type EC2), onde
-        // apagar tudo poderia remover um arquivo que outra task esta lendo.
+        // A limpeza roda SO na inicializacao, SO nos arquivos deste consumer (prefixo) e SO nos
+        // que passaram do tempo de retencao — seguro mesmo se TempPath apontar para um volume
+        // compartilhado entre tasks (EFS, volume de host no launch type EC2), onde apagar tudo
+        // poderia remover um arquivo que outra task esta lendo.
         _tempPrefix = Sanitize(config.GetValue<string>("Consumer:ConsumerId") ?? "worker");
         var retentionHours = Math.Max(1, config.GetValue<int>("Consumer:TempRetentionHours", 1));
         CleanupStaleTempFiles(TimeSpan.FromHours(retentionHours));
@@ -73,19 +88,56 @@ public class ParquetProcessor
     {
         var sourceFile = $"s3://{bucket}/{key}";
         var batchId = Guid.NewGuid();
-        var tempFile = Path.Combine(_tempPath, $"{_tempPrefix}-{batchId:N}.parquet");
+
+        FileStream? arquivoLocal = null;
+        S3RangeStream? streamS3 = null;
+        string? tempFile = null;
+        long objectSize = 0;
 
         try
         {
-            var bytes = await DownloadToFileAsync(bucket, key, tempFile, ct);
-            _logger.LogInformation(
-                "Downloaded {Source} -> {File} ({Mb:F1} MB em disco, flush de {Batch} linhas)",
-                sourceFile, tempFile, bytes / 1024.0 / 1024.0, _flushBatchSize);
+            Stream origem;
 
-            var result = await ProcessRowGroupsAsync(tempFile, sourceFile, batchId, target, ct);
+            if (UseS3Range)
+            {
+                objectSize = await S3RangeStream.GetObjectSizeAsync(_s3, bucket, key, ct);
+                streamS3 = new S3RangeStream(_s3, bucket, key, objectSize, _rangeBlockBytes);
+                origem = streamS3;
+
+                _logger.LogInformation(
+                    "Origem {Mode} para {Source}: {Mb:F1} MB no S3, bloco de {Block} MB, nada vai para disco",
+                    _readMode, sourceFile, objectSize / 1024.0 / 1024.0, _rangeBlockBytes / 1024 / 1024);
+            }
+            else
+            {
+                tempFile = Path.Combine(_tempPath, $"{_tempPrefix}-{batchId:N}.parquet");
+                var bytes = await DownloadToFileAsync(bucket, key, tempFile, ct);
+                objectSize = bytes;
+                _metrics.BytesDownloaded.Inc(bytes);
+                arquivoLocal = new FileStream(
+                    tempFile, FileMode.Open, FileAccess.Read, FileShare.Read, StreamBufferSize, useAsync: true);
+                origem = arquivoLocal;
+
+                _logger.LogInformation(
+                    "Origem {Mode} para {Source}: {Mb:F1} MB em disco, flush de {Batch} linhas",
+                    _readMode, sourceFile, bytes / 1024.0 / 1024.0, _flushBatchSize);
+            }
+
+            var result = await ProcessRowGroupsAsync(origem, sourceFile, batchId, target, ct);
+
+            if (streamS3 is not null)
+            {
+                _metrics.BytesDownloaded.Inc(streamS3.TotalBytesFetched);
+                _metrics.RangeRequests.Inc(streamS3.Requests);
+
+                _logger.LogInformation(
+                    "Origem {Mode}: {Mb:F1} MB transferidos em {Req} requisicoes ({Pct}) do objeto",
+                    _readMode, streamS3.TotalBytesFetched / 1024.0 / 1024.0, streamS3.Requests,
+                    objectSize > 0 ? $"{streamS3.TotalBytesFetched * 100.0 / objectSize:F1}%" : "n/d");
+            }
 
             _metrics.FilesProcessed.Inc();
-            _metrics.LastFileBytes.Set(bytes);
+            _metrics.LastFileBytes.Set(objectSize);
             _metrics.LastFileRows.Set(result.TotalRows);
 
             _logger.LogInformation(
@@ -96,12 +148,14 @@ public class ParquetProcessor
         }
         finally
         {
-            TryDeleteTempFile(tempFile);
+            if (arquivoLocal is not null) await arquivoLocal.DisposeAsync();
+            if (streamS3 is not null) await streamS3.DisposeAsync();
+            if (tempFile is not null) TryDeleteTempFile(tempFile);
         }
     }
 
     /// <summary>
-    /// Streaming do S3 para disco. O arquivo nunca vai inteiro para a memoria:
+    /// Streaming do S3 para disco (modo LocalFile). O arquivo nunca vai inteiro para a memoria:
     /// era exatamente aqui que o pod estourava (MemoryStream com o objeto completo).
     /// </summary>
     private async Task<long> DownloadToFileAsync(string bucket, string key, string tempFile, CancellationToken ct)
@@ -111,19 +165,13 @@ public class ParquetProcessor
             tempFile, FileMode.Create, FileAccess.Write, FileShare.None, StreamBufferSize, useAsync: true);
 
         await response.ResponseStream.CopyToAsync(file, StreamBufferSize, ct);
-
-        var length = file.Length;
-        _metrics.BytesDownloaded.Inc(length);
-        return length;
+        return file.Length;
     }
 
     private async Task<ProcessResult> ProcessRowGroupsAsync(
-        string tempFile, string sourceFile, Guid batchId, string target, CancellationToken ct)
+        Stream origem, string sourceFile, Guid batchId, string target, CancellationToken ct)
     {
-        await using var file = new FileStream(
-            tempFile, FileMode.Open, FileAccess.Read, FileShare.Read, StreamBufferSize, useAsync: true);
-
-        using var reader = await ParquetReader.CreateAsync(file, cancellationToken: ct);
+        using var reader = await ParquetReader.CreateAsync(origem, cancellationToken: ct);
 
         // Projecao: so os campos que vao para custody_position sao lidos do arquivo.
         var dataFields = reader.Schema.GetDataFields();

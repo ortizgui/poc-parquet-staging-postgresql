@@ -39,7 +39,7 @@ flowchart TD
 2. S3 Event Notification → SQS (Captura Carteira)
        ↓
 3. ECS Consumer:
-       a. baixa o objeto do S3 por STREAMING para arquivo temporário em disco
+       a. abre um stream seekable do objeto no S3 (S3Range: Range GET | LocalFile: temp file)
        b. lê o Parquet ROW GROUP por ROW GROUP (o row group é a página)
        c. fatia cada row group em lotes de `FlushBatchSize` (default 2000)
        d. upsert incremental e descarte do lote
@@ -124,6 +124,51 @@ mínimo de RAM do pod para aquele arquivo.
 - **Paralelismo em produção vem de tasks**, não de workers: escale com
   `--scale consumer=N` (ou o desired count da task no ECS). Cada task tem o próprio disco e o
   próprio row group, então o custo de memória e de disco é por task.
+
+### Modos de leitura do Parquet no S3 (`Consumer:ReadMode`)
+
+Existem duas formas de obter um stream seekable do objeto — o `ParquetReader` só exige isso, e o
+resto do pipeline (paginação, flush, projeção, métricas) é idêntico nos dois casos.
+
+**`S3Range` (default)** — um `Stream` seekable sobre **Range GET**. O reader lê os últimos 8 bytes
+(tamanho do footer), busca o footer e, a partir dele, pede ao S3 apenas os bytes de cada column
+chunk. Nada vai para disco.
+
+- Por que funciona: o acesso do `ParquetReader` já é "leia o footer, depois vá pegando pedaços" —
+  os `Seek`/`Read` dele são traduzidos em requisições HTTP com header `Range`.
+- **Com projeção de colunas o ganho é grande**: você não lê as colunas que não vão para o banco.
+- Detalhe que engana: a busca **não** é alinhada a blocos fixos. Alinhar em 8 MB transferiria ~18×
+  mais que o necessário num layout em que o column chunk tem ~450 KB — mais tráfego que baixar o
+  arquivo inteiro. A busca é exata, com piso de 256 KB (`MinFetchBytes`) e teto de `RangeBlockMb`.
+
+**`LocalFile`** — baixa o objeto por *streaming* para um arquivo temporário e lê o arquivo local.
+Uma requisição grande, leitura local a partir daí, e exige espaço em disco do tamanho do objeto
+(veja `ephemeralStorage` no Fargate e a higiene do diretório temporário).
+
+### Medido: mesmo resultado, tráfego 34× menor
+
+Mesmo arquivo (`prod_400k_20rg`, 358.9 MB, 20 row groups, 40 colunas — 5 lidas), limite de 512 MB:
+
+| Modo | Linhas | Pico de memória | Bytes transferidos do S3 | Requisições |
+|------|--------|-----------------|--------------------------|-------------|
+| **`S3Range`** | 389.417 | 104 MiB | **10.4 MB (2,9% do objeto)** | 44 |
+| `LocalFile` | 389.417 | 91 MiB | 358.9 MB (100% do objeto) | 1 |
+
+O mesmo resultado, com **34× menos tráfego** — e sem tocar em disco. O número é melhor do que a
+razão de colunas (5 de 40 = 12,5%) porque as colunas que *não* são lidas são justamente as de texto
+largo e alta cardinalidade, que comprimem mal: elas dominam o tamanho do arquivo.
+
+Quando escolher:
+
+- **`S3Range`** — default, e o melhor ponto de partida em produção: sem disco, menos tráfego com
+  projeção, permite ler parcialmente. Custo: mais requisições (em volume de arquivo grande, ordens
+  de 10-100 GETs) e um pouco mais de código.
+- **`LocalFile`** — quando você precisa reler o mesmo arquivo várias vezes no mesmo processamento,
+  quando a rede até o S3 é lenta/instável e uma transferência única é preferível, ou como caminho
+  mais simples para depurar (o arquivo fica no container para inspeção).
+
+> `poc_parquet_bytes_downloaded_total` e `poc_parquet_range_requests_total` no `/metrics` mostram o
+> tráfego real de cada modo — é a métrica que prova o ganho da projeção no Range GET.
 
 ### Como ler a curva de memória (evita falso negativo)
 
@@ -353,6 +398,8 @@ src/Worker/
 | `Consumer:FlushBatchSize` | 2000 | Linhas acumuladas antes de cada flush no banco. **É o principal controle de pico de memória por lote** |
 | `Consumer:TempPath` | `/tmp/poc-ingest` | Onde o parquet é materializado em disco (nunca inteiro na RAM) |
 | `Consumer:MaxMessages` | 0 | Limita mensagens processadas e encerra (útil em teste) |
+| `Consumer:ReadMode` | `S3Range` | `S3Range` (Range GET, sem disco) ou `LocalFile` (baixa para arquivo temporário) |
+| `Consumer:RangeBlockMb` | 8 | Teto de bytes por requisição Range (a busca tem piso de 256 KB) |
 | `Consumer:DlqName` | `poc-notification-dlq` | Fila de destino das mensagens que esgotam as tentativas |
 | `Consumer:VisibilityTimeoutSeconds` | 300 | Visibility timeout pedido no receive |
 | `Consumer:VisibilityHeartbeatSeconds` | 60 | De quanto em quanto tempo a visibilidade é renovada durante o processamento |

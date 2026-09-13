@@ -29,7 +29,11 @@ public class IngestMetrics
 
     public Counter BytesDownloaded { get; } = Metrics.CreateCounter(
         "poc_parquet_bytes_downloaded_total",
-        "Bytes baixados do S3");
+        "Bytes efetivamente transferidos do S3 (no modo S3Range: so o que foi lido)");
+
+    public Counter RangeRequests { get; } = Metrics.CreateCounter(
+        "poc_parquet_range_requests_total",
+        "Requisicoes Range GET feitas ao S3 (modo S3Range)");
 
     public Counter RecordsInserted { get; } = Metrics.CreateCounter(
         "poc_db_records_inserted_total",

@@ -72,9 +72,17 @@ services:
       Consumer__VisibilityTimeoutSeconds: "300"
       Consumer__VisibilityHeartbeatSeconds: "60"
       Consumer__MaxReceiveCount: "3"
+      # Modo de leitura do Parquet no S3:
+      #   S3Range   -> stream seekable sobre Range GET: le o footer e busca so os bytes
+      #                necessarios. Sem disco. Com projecao de colunas, transfere so a fracao
+      #                das colunas lidas (ex.: 5 de 40).
+      #   LocalFile -> baixa o objeto para arquivo temporario e le local. 1 requisicao grande,
+      #                exige disco do tamanho do objeto.
+      Consumer__ReadMode: S3Range
+      Consumer__RangeBlockMb: "8"
       # Paginacao: linhas acumuladas antes de cada flush no banco
       Consumer__FlushBatchSize: "2000"
-      # Onde o parquet e materializado em disco (nunca inteiro na RAM)
+      # Usado apenas no modo LocalFile
       Consumer__TempPath: /tmp/poc-ingest
       Consumer__TempRetentionHours: "1"
       PostgreSQL__BatchSize: "2000"
