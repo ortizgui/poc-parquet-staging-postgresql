@@ -22,8 +22,8 @@ import json
 import os
 import sys
 
-CORES = {"ok": "#2ca02c", "falhou": "#d62728", "nao-deterministico": "#ff7f0e", "OOMKilled": "#8c564b"}
-ROTULOS = {"ok": "OK", "falhou": "OutOfMemory", "nao-deterministico": "oscilou", "OOMKilled": "OOMKilled"}
+CORES = {"ok": "#2ca02c", "falhou": "#d62728", "nao-deterministico": "#ff7f0e", "OOMKilled": "#8c564b", "falha_memoria": "#8c564b"}
+ROTULOS = {"ok": "OK", "falhou": "OutOfMemory", "nao-deterministico": "oscilou", "OOMKilled": "OOMKilled", "falha_memoria": "Falha de memoria"}
 
 
 def ler_curva(path):

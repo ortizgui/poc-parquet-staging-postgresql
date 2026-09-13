@@ -51,7 +51,7 @@ services:
       dockerfile: src/Worker/Dockerfile
     container_name: poc-consumer
     # O limite e o eixo do teste: escolha por env sem editar arquivo.
-    #   CONSUMER_MEM_LIMIT=128m  -> demonstra o OOMKilled (o piso do runtime e ~150-200MB)
+    #   CONSUMER_MEM_LIMIT=128m  -> 128MB ainda PASSA (pico 108,5 MiB); 80m morre por memoria
     #   CONSUMER_MEM_LIMIT=512m -> default; arquivo de 1GB (2x o limite) passa
     #   CONSUMER_MEM_LIMIT=1g    -> comparativo com mais folga
     # memswap IGUAL ao limite de proposito: com swap disponivel o container sobrevive

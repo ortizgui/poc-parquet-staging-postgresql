@@ -300,19 +300,42 @@ em `+0 ins` e contagem estável.
 
 ## 8. Observabilidade — 4 golden signals
 
-O worker expõe `/metrics` (prometheus-net). Some à stack Prometheus + Grafana + cadvisor
-(orquestrada por `docker compose up` — zero clique manual).
+O worker expõe `/metrics` (prometheus-net) com as métricas `poc_*`. No **ambiente local**
+(`docker compose up`) a stack Prometheus + Grafana + **cadvisor** sobe provisionada, sem clique.
 
-| Signal | Métricas |
+| Signal | Métricas (aplicação) |
 |---|---|
 | **Traffic** | `poc_parquet_rows_processed_total`, `poc_parquet_bytes_downloaded_total`, `poc_parquet_range_requests_total` |
 | **Latency** | `poc_parquet_rowgroup_read_seconds`, `poc_db_upsert_seconds` |
 | **Errors** | `poc_ingest_invalid_records_total`, `poc_sqs_message_failures_total`, `poc_sqs_messages_sent_to_dlq_total`, `poc_sqs_dlq_depth` |
-| **Saturation** | `container_memory_working_set_bytes` (cadvisor — **é do pod**, não do processo), throttling de CPU, + GC/working set do runtime |
+| **Saturation** | saturação do **pod** — no compose vem do cadvisor; no Fargate, do Container Insights (abaixo) |
 
-**Por que cadvisor e não só as métricas do processo:** a pergunta é "o pod vai ser morto por
-`OOMKilled`?", e quem decide isso é o limite do cgroup — não o heap gerenciado do .NET. Medir só o
-heap dá falso negativo.
+### No ECS Fargate o `cadvisor` NÃO existe
+
+O `cadvisor` é um agente de **host**: lê cgroups e o `/var/run/docker.sock` da máquina. O Fargate
+**não expõe o host nem permite rodar esse agente**, então `container_memory_working_set_bytes` /
+`container_spec_memory_limit_bytes` são um recurso **exclusivo do compose local** — não conte com
+essas séries em produção. Os equivalentes oficiais na AWS:
+
+| Pergunta | Fonte no ECS Fargate |
+|---|---|
+| Memória da task vs. limite (working set) | **CloudWatch Container Insights** — `MemoryUtilized` e `MemoryReserved` (por task/container); CPU: `CpuUtilized` / `CpuReserved` |
+| O pod foi morto por memória (modo kernel)? | **`OOMKilled` no estado do container** + o **stop reason** da task (ECS Console/API/eventos) — não é uma métrica de cgroup |
+| O runtime lançou OOM gerenciado? | **CloudWatch Logs** do worker: `System.OutOfMemoryException` (o `OOMKilled` fica `false`) |
+| Heap/working set do processo .NET | `/metrics` do worker (`dotnet_total_memory_bytes`, etc.) |
+
+Ou seja: compare `MemoryUtilized` com `MemoryReserved` (a reserva de memória da task) e trate
+`OOMKilled`/stop reason **e** a exceção gerenciada como os sinais de saturação do pod.
+
+**Como levar `/metrics` para a AWS:** scrape via **ADOT Collector / CloudWatch agent** (sidecar ou
+daemon no ECS) para o CloudWatch, ou para o **Amazon Managed Service for Prometheus (AMP)** com
+consulta no Grafana. A aplicação continua expondo `/metrics` no `Metrics:Port` (9464); a coleta é
+problema de infraestrutura.
+
+**Por que medir o pod e não só o processo:** a pergunta é "a task vai ser morta por memória?", e
+quem decide pode ser o limite da task (kernel) **ou** o heap hard limit do .NET (exceção gerenciada)
+— não o heap gerenciado sozinho. Medir só o heap dá falso negativo; medir só o `OOMKilled` perde o
+modo gerenciado (§14).
 
 **Onde olhar primeiro:** comparação entre `poc_parquet_bytes_downloaded_total` e
 `poc_ingest_last_file_bytes` mostra na hora se a projeção de colunas está funcionando (esperado:
@@ -398,6 +421,8 @@ Ser explícito aqui evita surpresa no primeiro deploy.
 - Que a transferência cai para **2,8%** com projeção de colunas
 - Idempotência (`+0 ins` em reprocesso), DLQ de mensagem inválida, heartbeat de visibility
 - Pinning por ETag ativo (o header `If-Match` é enviado e o ETag é registrado no log)
+- O golden signal de saturação **local**, via `cadvisor` no compose — que **não existe no Fargate**
+  (em produção, use Container Insights; ver §8)
 
 ### Depende do ambiente real (não é validável no emulador)
 
@@ -405,7 +430,8 @@ Ser explícito aqui evita surpresa no primeiro deploy.
 |---|---|---|
 | **Policy IAM** | o emulador não valida IAM | subir a task com a policy de §9 e conferir que não há `AccessDenied` |
 | **Latência real de cada Range GET** | emulador é local (sub-ms); S3 real é ~5–30 ms por requisição | 120 requests × 20 ms ≈ **2,4 s** adicionados a uma ingestão de ~75 s — irrelevante, mas confirme |
-| **Sizing do Fargate** | o ambiente de teste não é uma task Fargate | comparar `container_memory_working_set_bytes` com o `memory` da task definition |
+| **Sizing e saturação do Fargate** | o ambiente de teste não é uma task Fargate e o `cadvisor` **não roda no Fargate** | habilitar **Container Insights** e comparar `MemoryUtilized` / `MemoryReserved` com o `memory` da task definition |
+| **Modo de falha por memória** | depende do GC hard limit e do limite da task; o emulador local viu os dois modos (§14) | confirmar no primeiro deploy que `OOMKilled`/stop reason **e** `OutOfMemoryException` são detectáveis |
 | **RDS: pool de conexões e latência** | o Postgres local não tem a latência nem os limites de conexão do RDS | observar `poc_db_upsert_seconds` |
 | **Throughput de rede da task** | Fargate tem limite por tamanho de task | ingestão de 1 GB pode saturar 0,5 vCPU em rede |
 
@@ -421,14 +447,40 @@ implementa a mesma semântica de Range. A diferença é **latência e IAM**, nã
 - [ ] Notificação de evento S3 (`s3:ObjectCreated:*`, sufixo `.parquet`) → fila SQS
 - [ ] Fila com `RedrivePolicy` apontando para a DLQ (`maxReceiveCount: 3`)
 - [ ] Alarme de CloudWatch na **profundidade da DLQ > 0**
-- [ ] Alarme em `container_memory_working_set_bytes` próximo do limite da task
+- [ ] Alarmes no **Container Insights**: `MemoryUtilized` próximo de `MemoryReserved`, CPU/throttling e restarts da task (`container_memory_working_set_bytes` é **só do compose**)
+- [ ] Alarmes de aplicação nos `poc_*` de erro (`poc_ingest_invalid_records_total`, `poc_sqs_message_failures_total`, `poc_sqs_messages_sent_to_dlq_total`)
 - [ ] Task role com a policy mínima de §9 (`sqs:ChangeMessageVisibility` incluído)
+- [ ] **S3 Gateway VPC Endpoint** nas subnets privadas (evita NAT para o Range GET)
 - [ ] `Consumer:ReadMode=S3Range` e `Consumer:PinObjectVersion=true`
 - [ ] `Consumer:VisibilityHeartbeatSeconds` **menor** que `VisibilityTimeoutSeconds`
 - [ ] Imagem publicada para a arquitetura da task (`ARM64` se Graviton)
 - [ ] Logs do worker no CloudWatch Logs, com retenção definida
-- [ ] `desired count` do service desligado no primeiro deploy — subir 1 task e validar
+- [ ] `desired count` do service no **1** no primeiro deploy — validar uma ingestão de ponta a ponta antes de escalar
 - [ ] Conferir no log: `Origem S3Range ... nada vai para disco (pinning por ETag: "...")`
+
+### Visibilidade operacional no ECS
+
+O que monitorar para operar a ingestão no Fargate (validar tudo no primeiro deploy com
+`desiredCount=1` antes de escalar):
+
+| Sinal | Onde | Para que serve |
+|---|---|---|
+| Memória da task vs. reserva | Container Insights `MemoryUtilized` / `MemoryReserved` | saturação do pod; correlacionar com o `OOMKilled` |
+| `OOMKilled` / stop reason da task | ECS Console/API/eventos do serviço | modo **kernel** da falha por memória (§14) |
+| `System.OutOfMemoryException` | CloudWatch Logs do worker | modo **gerenciado** (não aparece no `OOMKilled`) |
+| Profundidade da DLQ | CloudWatch `ApproximateNumberOfMessagesVisible` da DLQ | **alarme > 0** — mensagem que falhou de verdade |
+| Restarts da task | Eventos do serviço ECS / `RunningCount` vs `DesiredCount` | crash loop e instabilidade |
+| Erros de aplicação | `/metrics`: `poc_ingest_invalid_records_total`, `poc_sqs_message_failures_total`, `poc_sqs_messages_sent_to_dlq_total`, `poc_sqs_dlq_depth` | saúde do parsing e do fluxo SQS |
+| CPU / throttling | Container Insights `CpuUtilized` / `CpuReserved` | ajuste de vCPU da task |
+
+Infra mínima de rede e permissão:
+
+- **S3 Gateway VPC Endpoint** no VPC das tasks, para subnets privadas: mantém o Range GET na rede da
+  AWS sem depender de NAT (mesmo ganho de bytes; muda o custo/roteamento).
+- **Task role** com `s3:GetObject` no bucket/prefixo (e `s3:GetObjectVersion` se pinar `VersionId`),
+  `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`, `sqs:GetQueueUrl` na fila de
+  entrada e `sqs:SendMessage` na DLQ — **`sqs:ChangeMessageVisibility` é obrigatório** (heartbeat).
+- Primeiro deploy com `desiredCount=1` e uma ingestão completa observada antes de aumentar o service.
 
 ---
 
@@ -454,9 +506,18 @@ implementa a mesma semântica de Range. A diferença é **latência e IAM**, nã
 - **O row group é o piso.** Um arquivo gravado com um único row group gigante não pode ser paginado
   pelo leitor — o pico vira o row group. A alavanca nesse caso é a **projeção de colunas** e,
   idealmente, **reescrever o arquivo com row groups menores** (o writer é nosso).
-- **O piso de memória é o row group, não o runtime.** Medido: 96 MB passa, 80 MB morre, e o worker
-  inicia até com 32 MB. A falha é `OOMKilled` **sem exceção no log** — não conte com
-  `OutOfMemoryException` para detectar (medido: 0 ocorrências em todos os limites).
+- **O piso de memória é o row group, não o runtime.** Medido: 128 MB passa, 96 MB passa, 80 MB
+  morre, e o worker inicia até com 32 MB (ocioso em ~30 MiB).
+- **A falha por memória tem DOIS modos — alerte sobre os dois.** (1) **`OOMKilled` do kernel**:
+  a task é morta pelo cgroup/runtime do Fargate, aparece como `OOMKilled=true` / stop reason da
+  task e **não há exceção no log**. (2) **`System.OutOfMemoryException` gerenciada**: o runtime .NET
+  lança **antes** de o cgroup matar (nesse caso `OOMKilled=false` e a task pode terminar com exit 0,
+  ficando 0 linhas). Qual modo ocorre depende do **`DOTNET_GCHeapHardLimitPercent`**: com `0x4B`
+  (75% do cgroup, o default desta POC) o heap gerenciado estoura primeiro e vira exceção; sem a
+  trava (ou com percentual maior) o kernel tende a matar antes. Como um OOM gerenciado **não**
+  aparece como `OOMKilled`, concentre o alerta nos **dois sinais**: stop reason/`OOMKilled` da task
+  **e** `OutOfMemoryException` no CloudWatch Logs + profundidade da DLQ. O runner local já aceita os
+  dois modos (`oomkilled` **ou** `out_of_memory`); `timeout`/DLQ isolados não contam como prova.
 - **Acesso sequencial por design.** O `S3RangeStream` não é thread-safe; o consumo é um row group
   por vez. Paralelizar row groups exigiria múltiplos streams — possível, fora do escopo da POC.
 - **Many small files:** o modelo é 1 mensagem = 1 arquivo grande. Para muitos arquivos pequenos, o

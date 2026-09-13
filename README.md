@@ -244,15 +244,19 @@ Medições de 2026-09-13, .NET 10.0.12, limite de 512 MB, S3 local. Detalhe por 
 | antes | prod_200k_10rg | 179.5 MB | 10 × 32.5 MB | 363 MB | oscilou: 1 rodada passou (197.324 linhas), a repetição estourou |
 | **depois** | **prod_400k_20rg** | **358.9 MB** | **20 × 32.5 MB** | **95 MB** | **OK — 389.417 linhas, 0 erros** |
 | depois | prod_200k_1rg | 167.9 MB | 1 × 312.7 MB | 149 MB | OK — 197.262 linhas |
-| depois | prod_400k_20rg | 358.9 MB | 20 × 32.5 MB | — | `OOMKilled` (exit 137) com limite de **128 MB** |
+| depois | large_1gb | 1040.8 MB | 58 × 32.5 MB | 108.5 MiB | OK com limite de **128 MB** |
+| depois | large_1gb | 1040.8 MB | 58 × 32.5 MB | 93.6 MiB | OK com limite de **96 MB** |
+| depois | large_1gb | 1040.8 MB | 58 × 32.5 MB | 76.1 MiB | Falha por memória com limite de **80 MB** |
 
 Leituras:
 
 - O arquivo **2,1× maior** passou com **4× menos memória** que o código anterior.
 - O código anterior opera no fio da navalha: o mesmo arquivo, no mesmo limite, passa numa rodada e
   estoura na seguinte. Resultado não determinístico é pior que falha consistente.
-- `128 MB` **não** é um limite viável: o runtime (.NET + AWS SDK + Npgsql + GC) já consome ~60 MB e
-  o kernel mata o container antes de qualquer coisa. O piso real é o runtime **mais** o row group.
+- O piso **não** é uma constante do runtime: o mesmo worker passa em **128 MB** (pico 108,5 MiB) e em
+  **96 MB** (pico 93,6 MiB), e morre em **80 MB** (falha por memória, exit 137). O pico se **adapta**
+  ao limite porque o GC do .NET é ciente do cgroup; o worker *inicia* até com 32 MB (ocioso em ~30 MiB).
+  O que não cabe é o processamento: o piso real é o **maior row group** (× colunas lidas).
 - O heap gerenciado do worker paginado ficou entre **12 e 32 MB** durante todo o processamento.
 
 ### Idempotência
@@ -277,6 +281,11 @@ docker compose up -d          # ja sobe prometheus, grafana e cadvisor
 O dashboard `POC Ingestão Parquet — Paginação e Memória` é **provisionado como código**
 (`observability/grafana/dashboards/ingestion-memory.json`) — sobe junto com o compose, sem clique.
 
+![Dashboard de ingestão — paginação e memória](docs/assets/ingestion-dashboard.png)
+
+> A captura acima é gerada após a revalidação (o binário é adicionado depois); o caminho já está
+> referenciado e coberto pelo `.gitignore` (`!docs/assets/*.png`).
+
 | Golden signal | Painéis | Métrica |
 |---------------|---------|---------|
 | **Traffic** | linhas/s, MB/s do S3, row groups e arquivos | `poc_parquet_rows_processed_total`, `poc_parquet_bytes_downloaded_total`, `poc_parquet_row_groups_total`, `poc_ingest_files_total` |
@@ -300,6 +309,7 @@ sem `container_memory_working_set_bytes` não há como comparar o consumo com o 
 | `setup_infra.py` | Cria S3 + SQS + DLQ + S3 Bucket Notification. Use `--sns` para criar SNS também |
 | `generate_large_parquet.py` | **Gera Parquet grande com `row_group_size` controlado** (`--rows`, `--target-size-mb`, `--row-group-rows`, `--columns`, `--upload`) |
 | `run_memory_test.sh` | **Roda o teste de memória**: dispara um parquet do S3 e acompanha memória + contagens |
+| `test_rowgroup_ab.sh` | **A/B decisivo com asserção**: gera os dois parquets (N row groups × 1 row group), sobe, roda nos dois e falha se o row group não for o piso. Executável — `./scripts/test_rowgroup_ab.sh --limit-mb 192` (smoke: `--rows 40000 --limit-mb 64`) |
 | `plot_memory_test.py` | **Gera o gráfico** a partir do JSON de resultados e das amostras de memória |
 | `simulate_s3_notification.py` | Simula notificação S3. Use `--mode sqs` (direto) ou `--mode sns` |
 | `generate_parquets.py` | Gera múltiplos arquivos Parquet e sobe para S3 |
@@ -314,6 +324,11 @@ sem `container_memory_working_set_bytes` não há como comparar o consumo com o 
 - **Docker** + Docker Compose
 - **Python 3.12+** com `pip` (para scripts de infra/geração)
 - **.NET 10 SDK** (opcional — apenas para desenvolvimento local; o build é feito via Docker)
+
+> **Dependências Python e `.venv`:** instale com `pip install -r requirements.txt` (boto3, pyarrow,
+> numpy). Os scripts de teste (`run_memory_test.sh`, `test_rowgroup_ab.sh`) preferem o interpretador
+> do `.venv` (`./.venv/bin/python3`) quando ele existe; senão caem no `python3` do PATH. Sobrescreva
+> com a env `PYTHON=/caminho/para/python`. O `test_rowgroup_ab.sh` é **executável** (modo 100755).
 
 > **Emulador AWS:** usamos **`ministackorg/ministack`** (free, MIT, drop-in na porta 4566).
 > O `localstack/localstack:latest` passou a exigir `LOCALSTACK_AUTH_TOKEN` e sai com
@@ -414,7 +429,7 @@ src/Worker/
 | `Consumer:RangeBlockMb` | 8 | Teto de bytes por requisição Range (a busca tem piso de 256 KB) |
 | `Consumer:DlqName` | `poc-notification-dlq` | Fila de destino das mensagens que esgotam as tentativas |
 | `Consumer:VisibilityTimeoutSeconds` | 300 | Visibility timeout pedido no receive |
-| `Consumer:VisibilityHeartbeatSeconds` | 60 | De quanto em quanto tempo a visibilidade é renovada durante o processamento |
+| `Consumer:VisibilityHeartbeatSeconds` | 15 | De quanto em quanto tempo a visibilidade é renovada durante o processamento (derivado do timeout se ausente; nunca ≥ timeout) |
 | `Consumer:MaxReceiveCount` | 3 | Tentativas antes de mover para a DLQ |
 | `Consumer:TempRetentionHours` | 1 | Idade mínima para o worker remover um temporário órfão na inicialização |
 | `PostgreSQL:BatchSize` | 2000 | Trava de segurança do fatiamento no upsert |
@@ -522,14 +537,17 @@ por nenhum código** e foi removido — paralelismo se faz por task, não por wo
 ## Limitações conhecidas
 
 - **O piso de memória NÃO é uma constante do runtime — quem manda é o row group.** Medido com o
-  arquivo de 1 GiB (row groups de 20k linhas, 32,5 MB descomprimidos): **passa em 96 MB, morre em
-  80 MB**. O worker *inicia* até com 32 MB (ocioso em ~30 MiB) — o que não cabe é o processamento.
+  arquivo de 1 GiB (row groups de 20k linhas, 32,5 MB descomprimidos): **passa em 128 MB, passa em
+  96 MB, morre em 80 MB**. O worker *inicia* até com 32 MB (ocioso em ~30 MiB) — o que não cabe é o
+  processamento.
 - **O pico se adapta ao limite.** O GC do .NET é ciente do cgroup e coleta mais agressivo sob
   pressão: o mesmo arquivo pica em 108 MiB com limite de 128 MB e em 93 MiB com limite de 96 MB.
   Para baixar o piso, reduza o **row group** no writer — não o lote de flush.
-- **A falha por memória não gera exceção.** Em nenhum limite testado apareceu `OutOfMemoryException`
-  no log. O kernel mata o container (`OOMKilled`, exit 137) sem que o runtime levante nada — por
-  isso o runner checa `State.OOMKilled` em vez da exceção.
+- **A falha por memória tem dois modos; não conte com um só.** Pode ser `OOMKilled` do kernel
+  (exit 137, `OOMKilled=true`, **sem** exceção no log) **ou** `System.OutOfMemoryException` gerenciada
+  lançada antes de o cgroup matar (nesse caso `OOMKilled=false`). O modo depende do heap hard limit
+  (`DOTNET_GCHeapHardLimitPercent`). Por isso o runner checa `State.OOMKilled` **e** a exceção, e a
+  operação deve alertar sobre os dois (stop reason da task **e** DLQ/exceção).
 - **O paralelismo é por task, e cada task paga o próprio pico**: dimensione o limite como
   `(baseline do runtime ~60 MB) + (row group × multiplicador)`. N tasks em paralelo = N × esse
   valor, mas em máquinas/limites diferentes — não há memória compartilhada entre elas.

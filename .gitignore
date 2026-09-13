@@ -13,8 +13,9 @@ venv/
 .vscode/
 .idea/
 
-# Data
-data/input/*.parquet
+# Data (parquet gerado pelo gerador/A-B — nunca versionado)
+data/*.parquet
+data/**/*.parquet
 
 # OS
 .DS_Store

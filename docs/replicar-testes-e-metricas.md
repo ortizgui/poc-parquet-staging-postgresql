@@ -24,6 +24,11 @@ reproduzido por outra pessoa não é prova.
 pip install -r requirements.txt
 ```
 
+> Os scripts de teste (`run_memory_test.sh`, `test_rowgroup_ab.sh`) resolvem o Python nesta ordem:
+> `$PYTHON` → `./.venv/bin/python3` (se existir) → `python3`. Por isso as dependências do
+> `requirements.txt` devem estar no `.venv` que você usa (o `.venv/` já está no `.gitignore`). O
+> `test_rowgroup_ab.sh` é **executável** (modo 100755): rode com `./scripts/test_rowgroup_ab.sh`.
+
 ---
 
 ## 2. Passo a passo — o ciclo completo
@@ -89,8 +94,14 @@ Para rodar o A/B inteiro (gera os dois, sobe e testa, com asserção):
 ./scripts/test_rowgroup_ab.sh --rows 40000 --limit-mb 64
 ```
 
-> Os arquivos gerados caem em `data/`, que está no `.gitignore` (`data/input/*.parquet`) — confirme
-> que o seu padrão cobre o caminho que você usar.
+> O UM_RG precisa falhar **por memória**; o script aceita os dois modos: `OOMKilled` do kernel
+> (exit 137, sem exceção) **ou** `System.OutOfMemoryException` gerenciada (`OOMKilled=false`, exit 0).
+> `timeout`/DLQ **não** contam como sucesso do teste (a falha por memória pode, inclusive, mandar a
+> mensagem para a DLQ depois — isso é consequência, não a prova).
+
+> Os arquivos gerados caem em `data/`, que está no `.gitignore` (`data/*.parquet` e
+> `data/**/*.parquet`) — o A/B grava `data/ab_*.parquet` e nada de parquet é versionado.
+> As exceções `!docs/assets/*.png` e `!docs/assets/*.csv` continuam valendo para as evidências.
 
 ---
 
@@ -100,7 +111,8 @@ O limite é o eixo do teste e é **env var — não precisa editar arquivo nenhu
 
 ```bash
 CONSUMER_MEM_LIMIT=512m docker compose up -d consumer
-CONSUMER_MEM_LIMIT=128m docker compose up -d consumer   # demonstra o OOMKilled
+CONSUMER_MEM_LIMIT=128m docker compose up -d consumer   # 128 MB ainda PASSA (pico 108,5 MiB)
+CONSUMER_MEM_LIMIT=80m  docker compose up -d consumer   # 80 MB: falha por memoria (ver §3)
 CONSUMER_MEM_LIMIT=1g   docker compose up -d consumer
 ```
 
@@ -140,7 +152,7 @@ São **três fontes**, e elas respondem perguntas diferentes. Use as três.
 
 ### 4.1 `docker stats` — o que decide o `OOMKilled`
 
-É o que o `run_memory_test.sh` já faz, a cada 2 s, gravando no CSV:
+É o que o `run_memory_test.sh` já faz, a cada 1 s, gravando no CSV:
 
 ```bash
 docker stats --no-stream --format '{{.MemUsage}}' poc-consumer
@@ -244,8 +256,9 @@ numérico em `docs/memory-test-results.json`.
 
 | Sintoma | Causa provável | O que fazer |
 |---|---|---|
-| A contagem final veio **maior** que o esperado | Fila contaminada: mensagem residual entregue junto com o disparo | O runner já drena e espera a propagação do `purge`. Se usou `--skip-purge`, não use para evidência. |
-| Resultado **`timeout`** com o container morto | `OOMKilled` **sem exceção no log** — medido: 0 ocorrências de `OutOfMemoryException` em todos os limites | O runner detecta via `State.OOMKilled` (não pela exceção). Confira `docker inspect poc-consumer --format '{{.State.OOMKilled}}'` — deve dar `true` com `exit 137`. |
+| A contagem final veio **maior** que o esperado | Fila contaminada: mensagem residual entregue junto com o disparo | O runner agora purga **main + DLQ** e exige visíveis **e** em-voo = 0 numa janela de settle (~15 s), com orçamento ~120 s. Se usou `--skip-purge`, não use para evidência. |
+| A/B deu **FALSO FAIL** no `UM_RG` (`out_of_memory`) logo no primeiro cenário | Notificação S3 **assíncrona** do upload entrou na fila **depois** do drain, e o consumer do MUITOS_RG pegou o arquivo de UM_RG | O A/B agora **desliga a notificação do bucket** durante o run (salva e restaura no fim) e drena **com o consumer DOWN** antes de subir, e **de novo** imediatamente antes do disparo explícito. Ver §2 e o cabeçalho do `test_rowgroup_ab.sh`. |
+| Resultado **`timeout`** com o container morto | Pode ser `OOMKilled` **sem exceção no log** (modo kernel) **ou** `System.OutOfMemoryException` (modo gerenciado, `OOMKilled=false`) | O runner cobre os dois: checa `State.OOMKilled` **e** a exceção no log. Confira `docker inspect poc-consumer --format '{{.State.OOMKilled}}'` — no modo kernel dá `true` com `exit 137`. |
 | Mensagem foi para a **DLQ** sem erro aparente | Ingestão mais longa que o visibility timeout | Confira a regra do heartbeat no README; o worker deriva o valor e nunca aceita heartbeat ≥ timeout. |
 | `docker compose up` falha no **localstack** | A tag `latest` passou a exigir license token (sai com código 55) | A POC usa `ministack` (MIT, drop-in na mesma porta). Ver comentário no `docker-compose.yml`. |
 | Painel do Grafana vazio | Prometheus sem alvo, ou a stack subiu antes do worker | `docker compose logs prometheus`; alvo é `consumer:9464`. |
@@ -255,7 +268,7 @@ numérico em `docs/memory-test-results.json`.
 
 ## 9. Replicar em outra máquina — checklist
 
-- [ ] `docker compose up -d` sobe **7 serviços** e o Grafana responde em `:3000`
+- [ ] `docker compose up -d` sobe **6 serviços** (`docker compose config --services`: postgres, ministack, consumer, prometheus, grafana, cadvisor) e o Grafana responde em `:3000`
 - [ ] `python3 scripts/setup_infra.py` cria bucket + fila + DLQ + notificação S3
 - [ ] `pip install -r requirements.txt` (boto3, pyarrow, numpy)
 - [ ] O arquivo de teste é gerado **ou** baixado — não precisa ser criado do zero
