@@ -1,0 +1,20 @@
+info: PocWorker.Services.SqsConsumerService[0]
+      [CONSUMER:dotnet-worker] Starting. Queue=http://localhost:4566/000000000000/poc-notification-queue, DLQ=http://localhost:4566/000000000000/poc-notification-dlq, Target=direct, visibility=300s (heartbeat 15s), maxReceiveCount=3
+info: PocWorker.Services.MetricsServerService[0]
+      Metricas expostas em http://0.0.0.0:9464/metrics
+info: PocWorker.Services.SqsConsumerService[0]
+      [CONSUMER:dotnet-worker] Processing: s3://poc-bucket/input/ab_1160000_1rg.parquet (tentativa 1/3)
+info: PocWorker.Services.ParquetProcessor[0]
+      Origem S3Range para s3://poc-bucket/input/ab_1160000_1rg.parquet: 964.1 MB no S3, bloco de 8 MB, nada vai para disco (pinning por ETag: "6b7f28179b503648df6aa1cc49023df1-121")
+fail: PocWorker.Services.SqsConsumerService[0]
+      [CONSUMER:dotnet-worker] Falha ao processar (tentativa 1/3). A mensagem volta apos o visibility timeout.
+      System.OutOfMemoryException: Exception of type 'System.OutOfMemoryException' was thrown.
+         at System.Array.<InternalCreate>g____PInvoke|0_0(QCallTypeHandle __type_native, Int32 __rank_native, Int32* __pLengths_native, Int32* __pLowerBounds_native, Int32 __fromArrayType_native, ObjectHandleOnStack __retArray_native)
+         at System.Array.<InternalCreate>g____PInvoke|0_0(QCallTypeHandle __type_native, Int32 __rank_native, Int32* __pLengths_native, Int32* __pLowerBounds_native, Int32 __fromArrayType_native, ObjectHandleOnStack __retArray_native)
+         at System.Array.CreateInstance(Type elementType, Int32 length)
+         at Parquet.Schema.DataField.UnpackDefinitions(Array definedData, Span`1 definitionLevels)
+         at Parquet.Data.DataColumn.get_Data()
+         at PocWorker.Services.ParquetProcessor.ProcessRowGroupsAsync(Stream origem, String sourceFile, Guid batchId, String target, CancellationToken ct) in /src/Services/ParquetProcessor.cs:line 262
+         at PocWorker.Services.ParquetProcessor.ProcessFileAsync(String bucket, String key, String target, CancellationToken ct) in /src/Services/ParquetProcessor.cs:line 135
+         at PocWorker.Services.ParquetProcessor.ProcessFileAsync(String bucket, String key, String target, CancellationToken ct) in /src/Services/ParquetProcessor.cs:line 162
+         at PocWorker.Services.SqsConsumerService.ProcessMessageAsync(Message message, CancellationToken ct) in /src/Services/SqsConsumerService.cs:line 222

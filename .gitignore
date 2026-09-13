@@ -43,3 +43,9 @@ run_simulation.sh
 # Harness local de validacao (bind mount nao atravessa dind)
 harness/
 !docs/assets/*.csv
+
+# Evidencias versionadas do A/B (o *.csv/*.png global ignoraria)
+!docs/evidencias/*.csv
+!docs/evidencias/*.png
+!docs/evidencias/*.log
+!docs/evidencias/*.txt

@@ -250,6 +250,10 @@ Gera o gráfico da curva a partir das amostras. Para um relatório mais completo
 `scripts/generate_report.py`. As evidências versionadas desta POC estão em `docs/assets/` e o resumo
 numérico em `docs/memory-test-results.json`.
 
+> A evidência **bruta** do A/B decisivo (192 MB, veredito PASS) está versionada em
+> [`evidencias/`](evidencias/README.md): log do runner, CSVs de memória, logs dos workers e metadata
+> dos parquets. É a referência para comparar o seu run com o run validado.
+
 ---
 
 ## 8. Troubleshooting

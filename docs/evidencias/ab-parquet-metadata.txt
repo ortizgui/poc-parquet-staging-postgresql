@@ -1,0 +1,97 @@
+==============================================================================
+METADADOS DOS PARQUETS DO A/B (paginacao por row group)
+==============================================================================
+gerado_em      : 2026-09-13T14:10:44
+ferramenta     : pyarrow 24.0.0 (ParquetFile.metadata)
+estimativa .NET: largest row group descomprimido x 3
+arquivos       : mesmo total de linhas (1.160.000) e 40 colunas; 5 projetadas no consumer
+
+------------------------------------------------------------------------------
+[MUITOS_RG] data/ab_1160000_20000rg.parquet
+------------------------------------------------------------------------------
+  tamanho em disco        : 1,091,378,033 bytes (1040.8 MiB)
+  num_rows                : 1,160,000
+  num_columns             : 40
+  num_row_groups          : 58
+  maior row group (descomp): 34,052,884 bytes (32.5 MiB)
+  estimativa .NET x3       : 97.4 MiB
+
+  per-row-group: indice, rows, uncompressed_bytes, uncompressed_MiB
+    rg[  0] rows=   20,000 bytes=    34,043,263 (     32.5 MiB)
+    rg[  1] rows=   20,000 bytes=    34,045,009 (     32.5 MiB)
+    rg[  2] rows=   20,000 bytes=    34,047,568 (     32.5 MiB)
+    rg[  3] rows=   20,000 bytes=    34,043,631 (     32.5 MiB)
+    rg[  4] rows=   20,000 bytes=    34,048,910 (     32.5 MiB)
+    rg[  5] rows=   20,000 bytes=    34,047,936 (     32.5 MiB)
+    rg[  6] rows=   20,000 bytes=    34,045,623 (     32.5 MiB)
+    rg[  7] rows=   20,000 bytes=    34,047,227 (     32.5 MiB)
+    rg[  8] rows=   20,000 bytes=    34,043,912 (     32.5 MiB)
+    rg[  9] rows=   20,000 bytes=    34,048,800 (     32.5 MiB)
+    rg[ 10] rows=   20,000 bytes=    34,048,133 (     32.5 MiB)
+    rg[ 11] rows=   20,000 bytes=    34,043,147 (     32.5 MiB)
+    rg[ 12] rows=   20,000 bytes=    34,043,171 (     32.5 MiB)
+    rg[ 13] rows=   20,000 bytes=    34,046,817 (     32.5 MiB)
+    rg[ 14] rows=   20,000 bytes=    34,046,126 (     32.5 MiB)
+    rg[ 15] rows=   20,000 bytes=    34,038,914 (     32.5 MiB)
+    rg[ 16] rows=   20,000 bytes=    34,044,630 (     32.5 MiB)
+    rg[ 17] rows=   20,000 bytes=    34,048,284 (     32.5 MiB)
+    rg[ 18] rows=   20,000 bytes=    34,047,711 (     32.5 MiB)
+    rg[ 19] rows=   20,000 bytes=    34,047,893 (     32.5 MiB)
+    rg[ 20] rows=   20,000 bytes=    34,048,645 (     32.5 MiB)
+    rg[ 21] rows=   20,000 bytes=    34,051,200 (     32.5 MiB)
+    rg[ 22] rows=   20,000 bytes=    34,035,763 (     32.5 MiB)
+    rg[ 23] rows=   20,000 bytes=    34,040,812 (     32.5 MiB)
+    rg[ 24] rows=   20,000 bytes=    34,048,546 (     32.5 MiB)
+    rg[ 25] rows=   20,000 bytes=    34,048,378 (     32.5 MiB)
+    rg[ 26] rows=   20,000 bytes=    34,045,292 (     32.5 MiB)
+    rg[ 27] rows=   20,000 bytes=    34,047,135 (     32.5 MiB)
+    rg[ 28] rows=   20,000 bytes=    34,044,874 (     32.5 MiB)
+    rg[ 29] rows=   20,000 bytes=    34,046,117 (     32.5 MiB)
+    rg[ 30] rows=   20,000 bytes=    34,048,483 (     32.5 MiB)
+    rg[ 31] rows=   20,000 bytes=    34,049,156 (     32.5 MiB)
+    rg[ 32] rows=   20,000 bytes=    34,051,427 (     32.5 MiB)
+    rg[ 33] rows=   20,000 bytes=    34,046,181 (     32.5 MiB)
+    rg[ 34] rows=   20,000 bytes=    34,047,468 (     32.5 MiB)
+    rg[ 35] rows=   20,000 bytes=    34,041,967 (     32.5 MiB)
+    rg[ 36] rows=   20,000 bytes=    34,043,372 (     32.5 MiB)
+    rg[ 37] rows=   20,000 bytes=    34,041,114 (     32.5 MiB)
+    rg[ 38] rows=   20,000 bytes=    34,052,220 (     32.5 MiB)
+    rg[ 39] rows=   20,000 bytes=    34,045,395 (     32.5 MiB)
+    rg[ 40] rows=   20,000 bytes=    34,046,752 (     32.5 MiB)
+    rg[ 41] rows=   20,000 bytes=    34,048,993 (     32.5 MiB)
+    rg[ 42] rows=   20,000 bytes=    34,052,884 (     32.5 MiB)
+    rg[ 43] rows=   20,000 bytes=    34,048,280 (     32.5 MiB)
+    rg[ 44] rows=   20,000 bytes=    34,050,592 (     32.5 MiB)
+    rg[ 45] rows=   20,000 bytes=    34,052,281 (     32.5 MiB)
+    rg[ 46] rows=   20,000 bytes=    34,048,585 (     32.5 MiB)
+    rg[ 47] rows=   20,000 bytes=    34,048,310 (     32.5 MiB)
+    rg[ 48] rows=   20,000 bytes=    34,048,816 (     32.5 MiB)
+    rg[ 49] rows=   20,000 bytes=    34,042,698 (     32.5 MiB)
+    rg[ 50] rows=   20,000 bytes=    34,047,081 (     32.5 MiB)
+    rg[ 51] rows=   20,000 bytes=    34,048,408 (     32.5 MiB)
+    rg[ 52] rows=   20,000 bytes=    34,051,489 (     32.5 MiB)
+    rg[ 53] rows=   20,000 bytes=    34,043,497 (     32.5 MiB)
+    rg[ 54] rows=   20,000 bytes=    34,047,974 (     32.5 MiB)
+    rg[ 55] rows=   20,000 bytes=    34,041,271 (     32.5 MiB)
+    rg[ 56] rows=   20,000 bytes=    34,049,941 (     32.5 MiB)
+    rg[ 57] rows=   20,000 bytes=    34,044,313 (     32.5 MiB)
+
+------------------------------------------------------------------------------
+[UM_RG] data/ab_1160000_1rg.parquet
+------------------------------------------------------------------------------
+  tamanho em disco        : 1,010,887,570 bytes (964.1 MiB)
+  num_rows                : 1,160,000
+  num_columns             : 40
+  num_row_groups          : 1
+  maior row group (descomp): 1,891,232,059 bytes (1803.6 MiB)
+  estimativa .NET x3       : 5410.9 MiB
+
+  per-row-group: indice, rows, uncompressed_bytes, uncompressed_MiB
+    rg[  0] rows=1,160,000 bytes= 1,891,232,059 (   1803.6 MiB)
+
+==============================================================================
+LEITURA
+==============================================================================
+  MUITOS_RG: 58 row groups de 20.000 linhas; o maior define o pico do leitor
+  UM_RG    : 1 row group unico — o leitor NAO consegue paginar abaixo dele.
+             Por isso o pico e proporcional ao row group, nao ao arquivo.

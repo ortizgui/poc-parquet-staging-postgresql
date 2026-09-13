@@ -1,0 +1,130 @@
+info: PocWorker.Services.SqsConsumerService[0]
+      [CONSUMER:dotnet-worker] Starting. Queue=http://localhost:4566/000000000000/poc-notification-queue, DLQ=http://localhost:4566/000000000000/poc-notification-dlq, Target=direct, visibility=300s (heartbeat 15s), maxReceiveCount=3
+info: PocWorker.Services.MetricsServerService[0]
+      Metricas expostas em http://0.0.0.0:9464/metrics
+info: PocWorker.Services.SqsConsumerService[0]
+      [CONSUMER:dotnet-worker] Processing: s3://poc-bucket/input/ab_1160000_20000rg.parquet (tentativa 1/3)
+info: PocWorker.Services.ParquetProcessor[0]
+      Origem S3Range para s3://poc-bucket/input/ab_1160000_20000rg.parquet: 1040.8 MB no S3, bloco de 8 MB, nada vai para disco (pinning por ETag: "e2f9cdee4e822652f6e3b208a415765a-131")
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 1/58] rows=20,000 | +19965 ins ~32 upd -0 err | managed=17MB workingSet=128MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 2/58] rows=20,000 | +39898 ins ~98 upd -0 err | managed=15MB workingSet=132MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 3/58] rows=20,000 | +59764 ins ~229 upd -0 err | managed=24MB workingSet=139MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 4/58] rows=20,000 | +79563 ins ~430 upd -0 err | managed=20MB workingSet=136MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 5/58] rows=20,000 | +99316 ins ~674 upd -0 err | managed=16MB workingSet=134MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 6/58] rows=20,000 | +119017 ins ~970 upd -0 err | managed=16MB workingSet=137MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 7/58] rows=20,000 | +138683 ins ~1299 upd -0 err | managed=24MB workingSet=144MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 8/58] rows=20,000 | +158290 ins ~1689 upd -0 err | managed=18MB workingSet=137MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 9/58] rows=20,000 | +177818 ins ~2159 upd -0 err | managed=21MB workingSet=139MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 10/58] rows=20,000 | +197324 ins ~2647 upd -0 err | managed=17MB workingSet=142MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 11/58] rows=20,000 | +216787 ins ~3181 upd -0 err | managed=17MB workingSet=142MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 12/58] rows=20,000 | +236157 ins ~3808 upd -0 err | managed=26MB workingSet=147MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 13/58] rows=20,000 | +255493 ins ~4468 upd -0 err | managed=19MB workingSet=141MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 14/58] rows=20,000 | +274797 ins ~5158 upd -0 err | managed=21MB workingSet=140MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 15/58] rows=20,000 | +294032 ins ~5920 upd -0 err | managed=17MB workingSet=146MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 16/58] rows=20,000 | +313224 ins ~6726 upd -0 err | managed=19MB workingSet=142MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 17/58] rows=20,000 | +332374 ins ~7573 upd -0 err | managed=19MB workingSet=152MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 18/58] rows=20,000 | +351430 ins ~8513 upd -0 err | managed=22MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 19/58] rows=20,000 | +370452 ins ~9489 upd -0 err | managed=17MB workingSet=152MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 20/58] rows=20,000 | +389417 ins ~10521 upd -0 err | managed=17MB workingSet=146MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 21/58] rows=20,000 | +408354 ins ~11582 upd -0 err | managed=25MB workingSet=156MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 22/58] rows=20,000 | +427204 ins ~12728 upd -0 err | managed=19MB workingSet=146MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 23/58] rows=20,000 | +446005 ins ~13925 upd -0 err | managed=22MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 24/58] rows=20,000 | +464717 ins ~15211 upd -0 err | managed=17MB workingSet=151MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 25/58] rows=20,000 | +483425 ins ~16499 upd -0 err | managed=15MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 26/58] rows=20,000 | +502137 ins ~17784 upd -0 err | managed=32MB workingSet=158MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 27/58] rows=20,000 | +520777 ins ~19140 upd -0 err | managed=20MB workingSet=155MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 28/58] rows=20,000 | +539334 ins ~20580 upd -0 err | managed=22MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 29/58] rows=20,000 | +557955 ins ~21955 upd -0 err | managed=18MB workingSet=155MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 30/58] rows=20,000 | +576454 ins ~23449 upd -0 err | managed=17MB workingSet=154MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 31/58] rows=20,000 | +594877 ins ~25022 upd -0 err | managed=17MB workingSet=161MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 32/58] rows=20,000 | +613242 ins ~26652 upd -0 err | managed=14MB workingSet=158MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 33/58] rows=20,000 | +631629 ins ~28263 upd -0 err | managed=17MB workingSet=156MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 34/58] rows=20,000 | +649836 ins ~30052 upd -0 err | managed=17MB workingSet=156MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 35/58] rows=20,000 | +668067 ins ~31820 upd -0 err | managed=26MB workingSet=164MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 36/58] rows=20,000 | +686268 ins ~33618 upd -0 err | managed=20MB workingSet=158MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 37/58] rows=20,000 | +704374 ins ~35509 upd -0 err | managed=22MB workingSet=158MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 38/58] rows=20,000 | +722388 ins ~37492 upd -0 err | managed=17MB workingSet=162MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 39/58] rows=20,000 | +740440 ins ~39438 upd -0 err | managed=18MB workingSet=160MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 40/58] rows=20,000 | +758426 ins ~41450 upd -0 err | managed=29MB workingSet=168MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 41/58] rows=20,000 | +776307 ins ~43566 upd -0 err | managed=20MB workingSet=158MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 42/58] rows=20,000 | +794171 ins ~45702 upd -0 err | managed=22MB workingSet=151MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 43/58] rows=20,000 | +812038 ins ~47829 upd -0 err | managed=17MB workingSet=156MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 44/58] rows=20,000 | +829822 ins ~50039 upd -0 err | managed=18MB workingSet=154MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 45/58] rows=20,000 | +847452 ins ~52405 upd -0 err | managed=17MB workingSet=153MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 46/58] rows=20,000 | +865197 ins ~54660 upd -0 err | managed=17MB workingSet=151MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 47/58] rows=20,000 | +882827 ins ~57024 upd -0 err | managed=22MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 48/58] rows=20,000 | +900427 ins ~59419 upd -0 err | managed=17MB workingSet=155MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 49/58] rows=20,000 | +917932 ins ~61912 upd -0 err | managed=20MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 50/58] rows=20,000 | +935490 ins ~64352 upd -0 err | managed=20MB workingSet=152MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 51/58] rows=20,000 | +952919 ins ~66923 upd -0 err | managed=22MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 52/58] rows=20,000 | +970321 ins ~69520 upd -0 err | managed=17MB workingSet=155MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 53/58] rows=20,000 | +987692 ins ~72145 upd -0 err | managed=18MB workingSet=152MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 54/58] rows=20,000 | +1005132 ins ~74705 upd -0 err | managed=29MB workingSet=162MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 55/58] rows=20,000 | +1022375 ins ~77460 upd -0 err | managed=20MB workingSet=147MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 56/58] rows=20,000 | +1039645 ins ~80187 upd -0 err | managed=22MB workingSet=149MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 57/58] rows=20,000 | +1056814 ins ~83016 upd -0 err | managed=17MB workingSet=154MB
+info: PocWorker.Services.ParquetProcessor[0]
+      [rg 58/58] rows=20,000 | +1073909 ins ~85920 upd -0 err | managed=18MB workingSet=152MB
+info: PocWorker.Services.ParquetProcessor[0]
+      Origem S3Range: 29.6 MB transferidos em 120 requisicoes (2.8%) do objeto
+info: PocWorker.Services.ParquetProcessor[0]
+      Result: +1073909 ins ~85920 upd -0 err / 1160000 total [s3://poc-bucket/input/ab_1160000_20000rg.parquet]
+info: PocWorker.Services.SqsConsumerService[0]
+      [CONSUMER:dotnet-worker] [OK] Msg #1, 1 file(s) processed, queue depth: 0

@@ -235,6 +235,10 @@ python3 scripts/plot_memory_test.py \
 Medições de 2026-09-13, .NET 10.0.12, limite de 512 MB, S3 local. Detalhe por cenário em
 [`docs/memory-test-results.json`](docs/memory-test-results.json).
 
+> A **evidência bruta versionada** do A/B decisivo a 192 MB (run final com veredito PASS): logs do
+> runner, CSVs de memória, logs dos workers e metadata dos parquets estão em
+> [`docs/evidencias/`](docs/evidencias/README.md).
+
 ![Memória antes x depois](docs/assets/memoria-antes-depois.png)
 
 | Código | Arquivo | Disco | Row groups | Pico | Resultado |

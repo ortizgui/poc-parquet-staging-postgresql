@@ -122,9 +122,10 @@
       "arquivo": "ab_muitos_rg (58 row groups, 32,5 MB descomprimidos cada)",
       "limite_mb": 192,
       "resultado": "ok",
-      "pico_mb": 108.0,
+      "pico_mb": 109.4,
       "linhas_gravadas": 1073909,
-      "detalhe": "Concluiu 58/58 row groups, 0 erros, pico de ~108 MiB. Espaco de caso POSITIVO: a memoria fica chapada porque o pico manda no MAIOR ROW GROUP, nao no arquivo."
+      "detalhe": "Concluiu 58/58 row groups, 0 erros, pico de ~109,4 MiB. Espaco de caso POSITIVO: a memoria fica chapada porque o pico manda no MAIOR ROW GROUP, nao no arquivo.",
+      "fonte": "docs/evidencias/ (run final 20260913_132022, ab-limit192-final.log)"
     },
     {
       "codigo": "A/B decisivo — MESMO limite (192 MB), MESMO total de linhas (1.160.000)",
@@ -137,12 +138,13 @@
         "modo_observado": "System.OutOfMemoryException gerenciada em ParquetProcessor.cs:262 (Parquet.Schema.DataField.UnpackDefinitions)",
         "OOMKilled": false,
         "exit": 0,
-        "pico_mib": 170.3,
+        "pico_mib": 176.9,
         "linhas_gravadas": 0
       },
-      "pico_mb": 170.3,
+      "pico_mb": 176.9,
       "linhas_gravadas": 0,
-      "detalhe": "ESTE e o caso de falha que faltava. Mesmo limite, mesmo volume de dados, 1 row group -> falha por memoria. Prova que o row group e a unidade que define o pico. O modo (kernel vs gerenciado) varia com o heap hard limit; ambos valem. Teste reproduzivel: scripts/test_rowgroup_ab.sh (com asercao; aceita OS DOIS modos de falha por memoria e rejeita timeout/DLQ)."
+      "detalhe": "ESTE e o caso de falha que faltava. Mesmo limite, mesmo volume de dados, 1 row group -> falha por memoria. Prova que o row group e a unidade que define o pico. No run final (20260913_132022) o modo observado foi a falha GERENCIADA: System.OutOfMemoryException em ParquetProcessor.cs:262 (Parquet.Schema.DataField.UnpackDefinitions), OOMKilled=false, exit 0, 0 linhas gravadas. O outro modo possivel e o kernel matar o container (OOMKilled=true, exit 137, sem excecao no log); ambos provam o mesmo piso. Teste reproduzivel: scripts/test_rowgroup_ab.sh (com asercao; aceita OS DOIS modos de falha por memoria e rejeita timeout/DLQ).",
+      "fonte": "docs/evidencias/ (run final 20260913_132022, ab-limit192-final.log)"
     }
   ],
   "idempotencia": {
@@ -203,7 +205,7 @@
   "conclusao": {
     "formula": "pico ~= overhead do runtime (~30 MiB ocioso) + bytes descomprimidos DAS COLUNAS PROJETADAS no maior row group + lote de flush",
     "regra": "O tamanho do ARQUIVO nao define o pico. O que define e (maior row group x colunas lidas). Um unico row group gigante NAO tem como ser paginado pelo leitor — o piso vira o proprio row group. Por isso row_group_size e decisao de quem ESCREVE o parquet, e a projecao de colunas e o ganho mais barato num schema largo.",
-    "evidencia_chave": "A/B com mesmo limite (192 MB) e mesmo volume (1,16M linhas): 58 row groups concluem com pico de ~108 MiB; 1 row group de 1,8 GB falha por memoria sem concluir. O modo de falha varia com o heap hard limit: OOMKilled do kernel (exit 137, sem excecao) OU System.OutOfMemoryException gerenciada (OOMKilled=false, exit 0). Medicao de 2026-09-13 (Docker Desktop, 192m, GCHeapHardLimitPercent=0x4B): modo gerenciado, OOMKilled=false, exit 0, pico ~170,3 MiB, 0 linhas. Teste versionado e com asercao em scripts/test_rowgroup_ab.sh (aceita OS DOIS modos).",
+    "evidencia_chave": "A/B com mesmo limite (192 MB) e mesmo volume (1,16M linhas): 58 row groups concluem com pico de ~109,4 MiB; 1 row group de 1,8 GB falha por memoria sem concluir. O modo de falha varia com o heap hard limit: OOMKilled do kernel (exit 137, sem excecao) OU System.OutOfMemoryException gerenciada (OOMKilled=false, exit 0). No run final (20260913_132022, Docker Desktop, 192m, GCHeapHardLimitPercent=0x4B) o modo observado foi o GERENCIADO: System.OutOfMemoryException em ParquetProcessor.cs:262 (Parquet.Schema.DataField.UnpackDefinitions), OOMKilled=false, exit 0, pico ~176,9 MiB, 0 linhas; o outro modo possivel e o kernel matar o container (OOMKilled=true, exit 137). Teste versionado e com asercao em scripts/test_rowgroup_ab.sh (aceita OS DOIS modos). Evidencia bruta em docs/evidencias/.",
     "modo_de_falha": "A deteccao NAO pode contar com um unico modo: (1) o OOMKilled do kernel/cgroup aparece como OOMKilled=true (cadvisor / stop reason da task ECS); (2) um OOM GERENCIADO deixa OOMKilled=false e so aparece como System.OutOfMemoryException no log do worker, seguido (ou nao) de DLQ. Por isso o teste e a operacao devem alertar sobre OS DOIS: OOMKilled/stop reason da task E profundidade da DLQ + excecao no log. Medir so o heap gerenciado da falso negativo; medir so o OOMKilled perde o modo gerenciado.",
     "correcao_2026_09_13": "Duas entradas anteriores afirmavam 128 MB -> OOMKilled com pico 0. A medicao refeita mostra 128 MB passando com pico de 108,5 MiB. Removidas. A afirmacao de 'piso do runtime ~150-200 MB' tambem estava errada: o worker inicia ate com 32 MB."
   }
