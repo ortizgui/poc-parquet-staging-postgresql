@@ -77,7 +77,29 @@ public class SqsConsumerService : BackgroundService
         _maxMessages = consumer.GetValue("MaxMessages", 0);
         _pollWaitSeconds = consumer.GetValue("PollWaitSeconds", 5);
         _visibilityTimeoutSeconds = Math.Max(10, consumer.GetValue("VisibilityTimeoutSeconds", 300));
-        _visibilityHeartbeatSeconds = Math.Max(5, consumer.GetValue("VisibilityHeartbeatSeconds", 60));
+
+        // O heartbeat TEM que disparar antes de a visibility expirar: se disparar depois, a
+        // mensagem reaparece no meio da ingestao e volta a ser entregue (trabalho duplicado,
+        // receive count inflando, DLQ indevida).
+        // Por isso ele nao e um valor solto:
+        //   - sem configuracao explicita, e DERIVADO do timeout (1/5 dele);
+        //   - com configuracao explicita, e limitado a METADE do timeout.
+        // Assim nao existe combinacao (timeout curto + heartbeat longo) que produza redelivery.
+        var configuredHeartbeat = consumer.GetValue<int?>("VisibilityHeartbeatSeconds");
+        var derivedHeartbeat = Math.Max(5, _visibilityTimeoutSeconds / 5);
+        _visibilityHeartbeatSeconds = Math.Clamp(
+            configuredHeartbeat ?? derivedHeartbeat,
+            5,
+            Math.Max(5, _visibilityTimeoutSeconds / 2));
+
+        if (configuredHeartbeat is not null && configuredHeartbeat >= _visibilityTimeoutSeconds)
+        {
+            _logger.LogWarning(
+                "[CONSUMER:{Id}] VisibilityHeartbeatSeconds={Hb}s >= VisibilityTimeoutSeconds={Vis}s — " +
+                "a mensagem reapareceria ANTES da renovacao. Reduzido para {Fixed}s (metade do timeout).",
+                _consumerId, configuredHeartbeat, _visibilityTimeoutSeconds, _visibilityHeartbeatSeconds);
+        }
+
         _maxReceiveCount = Math.Max(1, consumer.GetValue("MaxReceiveCount", 3));
     }
 

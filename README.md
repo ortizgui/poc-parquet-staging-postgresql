@@ -7,6 +7,10 @@ O ponto central desta POC: **ingerir um arquivo maior que a RAM do container**. 
 Parquet row group a row group, faz flush no banco e descarta — a memória fica chapada em vez de
 acompanhar o tamanho do arquivo.
 
+> **Rodando na AWS?** Veja [`docs/aws-producao-ecs-fargate.md`](docs/aws-producao-ecs-fargate.md) —
+> fluxo end-to-end em ECS Fargate, mecânica da leitura parcial com o trace de requisições, policy
+> IAM mínima, dimensionamento, pinning por ETag e o que está provado vs. o que valida no ambiente real.
+
 ## Arquitetura
 
 ```mermaid
@@ -448,8 +452,25 @@ ingestão** — outro consumer baixa o mesmo arquivo de novo, o `ApproximateRece
 nada esteja errado e a mensagem é empurrada para a **DLQ mesmo quando a ingestão ia terminar bem**.
 
 Por isso o consumer renova a visibilidade a cada `Consumer:VisibilityHeartbeatSeconds` enquanto
-processa. Medido: com `visibility=10s` (menor que os ~38 s da ingestão) a mensagem foi entregue
-**1 vez** com **6 renovações** — sem o heartbeat, seria redeliverada 3-4 vezes.
+processa.
+
+**Regra: o heartbeat TEM que disparar antes de a visibility expirar.** Ele não é um valor solto —
+sem configuração explícita é **derivado** do timeout (1/5 dele); com configuração explícita é
+**limitado à metade do timeout**. `VisibilityHeartbeatSeconds >= VisibilityTimeoutSeconds` é o
+cenário que produz redelivery (timeout curto + heartbeat longo), e é impossível configurá-lo por
+engano: o worker detecta no startup, loga o aviso e reduz sozinho.
+
+```
+[CONSUMER:default] VisibilityHeartbeatSeconds=60s >= VisibilityTimeoutSeconds=20s — a mensagem
+reapareceria ANTES da renovacao. Reduzido para 10s (metade do timeout).
+```
+
+Medido no arquivo de 1 GB (ingestão de ~75 s, `visibility=300s` / `heartbeat=15s`): **1 entrega,
+1 conclusão, 5 renovações, 0 redelivery**.
+
+O `visibility` fica alto o bastante para uma ingestão inteira caber numa única janela mesmo se o
+heartbeat falhar — ele é a rede de segurança, não o mecanismo primário. Regra de bolso:
+`visibility >= tempo esperado de ingestão` e `heartbeat = visibility / 5`.
 
 ### Dead Letter Queue
 

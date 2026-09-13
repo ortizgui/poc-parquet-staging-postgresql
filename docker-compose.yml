@@ -69,8 +69,12 @@ services:
       # Ingestao de arquivo grande leva minutos e o visibility timeout conta a partir da
       # ENTREGA: sem renovacao a mensagem volta no meio da ingestao, o trabalho duplica e o
       # receive count infla, empurrando a mensagem para a DLQ sem erro real.
+      # Heartbeat de visibility: renova a cada N s enquanto a ingestao roda. TEM que ser bem
+      # menor que o VisibilityTimeoutSeconds (senao a mensagem reaparece antes da renovacao).
+      # O worker deriva o valor do timeout quando nao vem configurado, e nunca aceita um
+      # heartbeat >= timeout. 15s da margem de 20x sobre os 300s.
       Consumer__VisibilityTimeoutSeconds: "300"
-      Consumer__VisibilityHeartbeatSeconds: "60"
+      Consumer__VisibilityHeartbeatSeconds: "15"
       Consumer__MaxReceiveCount: "3"
       # Modo de leitura do Parquet no S3:
       #   S3Range   -> stream seekable sobre Range GET: le o footer e busca so os bytes
@@ -80,6 +84,11 @@ services:
       #                exige disco do tamanho do objeto.
       Consumer__ReadMode: S3Range
       Consumer__RangeBlockMb: "8"
+      # Pinning: envia If-Match com o ETag do objeto em toda requisicao Range. Se o arquivo for
+      # sobrescrito durante a leitura, o S3 devolve 412 em vez de misturar bytes de duas versoes.
+      Consumer__PinObjectVersion: "true"
+      # Loga cada Range GET (offset/tamanho). Use para provar a sequencia de leitura; ruidoso.
+      Consumer__RangeTraceLog: "false"
       # Paginacao: linhas acumuladas antes de cada flush no banco
       Consumer__FlushBatchSize: "2000"
       # Usado apenas no modo LocalFile

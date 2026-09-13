@@ -45,6 +45,8 @@ public class ParquetProcessor
     private readonly int _flushBatchSize;
     private readonly string _readMode;
     private readonly int _rangeBlockBytes;
+    private readonly bool _pinObjectVersion;
+    private readonly bool _rangeTrace;
 
     private const int StreamBufferSize = 1 << 16; // 64 KiB
 
@@ -70,6 +72,8 @@ public class ParquetProcessor
         _flushBatchSize = Math.Max(1, config.GetValue<int>("Consumer:FlushBatchSize", 2000));
         _readMode = config.GetValue<string>("Consumer:ReadMode") ?? ReadModeS3Range;
         _rangeBlockBytes = Math.Max(1, config.GetValue<int>("Consumer:RangeBlockMb", 8)) * 1024 * 1024;
+        _pinObjectVersion = config.GetValue<bool>("Consumer:PinObjectVersion", true);
+        _rangeTrace = config.GetValue<bool>("Consumer:RangeTraceLog", false);
 
         Directory.CreateDirectory(_tempPath);
 
@@ -100,13 +104,18 @@ public class ParquetProcessor
 
             if (UseS3Range)
             {
-                objectSize = await S3RangeStream.GetObjectSizeAsync(_s3, bucket, key, ct);
-                streamS3 = new S3RangeStream(_s3, bucket, key, objectSize, _rangeBlockBytes);
+                var info = await S3RangeStream.GetObjectInfoAsync(_s3, bucket, key, ct);
+                objectSize = info.Length;
+                streamS3 = new S3RangeStream(
+                    _s3, bucket, key, objectSize, _rangeBlockBytes,
+                    etag: info.ETag, pinVersion: _pinObjectVersion, logger: _logger, trace: _rangeTrace);
                 origem = streamS3;
 
                 _logger.LogInformation(
-                    "Origem {Mode} para {Source}: {Mb:F1} MB no S3, bloco de {Block} MB, nada vai para disco",
-                    _readMode, sourceFile, objectSize / 1024.0 / 1024.0, _rangeBlockBytes / 1024 / 1024);
+                    "Origem {Mode} para {Source}: {Mb:F1} MB no S3, bloco de {Block} MB, nada vai para disco " +
+                    "(pinning por ETag: {Pin})",
+                    _readMode, sourceFile, objectSize / 1024.0 / 1024.0, _rangeBlockBytes / 1024 / 1024,
+                    _pinObjectVersion && !string.IsNullOrEmpty(info.ETag) ? info.ETag : "desativado");
             }
             else
             {

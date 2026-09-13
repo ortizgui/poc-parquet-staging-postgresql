@@ -4,6 +4,14 @@ using Amazon.S3.Model;
 namespace PocWorker.Services;
 
 /// <summary>
+/// Metadados do objeto necessarios para a leitura parcial.
+/// </summary>
+/// <param name="Length">Tamanho em bytes (para achar o footer pelo fim do arquivo).</param>
+/// <param name="ETag">Identidade do conteudo usado no pinning (If-Match).</param>
+/// <param name="VersionId">Versao, quando o bucket tem versionamento habilitado.</param>
+public readonly record struct S3ObjectInfo(long Length, string? ETag, string? VersionId);
+
+/// <summary>
 /// Stream <b>seekable</b> sobre o S3 usando <c>Range GET</c>.
 ///
 /// Para que serve: o <c>ParquetReader.CreateAsync(Stream)</c> so exige um stream legivel e
@@ -25,6 +33,14 @@ namespace PocWorker.Services;
 /// Memoria: limitada ao maior intervalo buscado (<c>RangeBlockMb</c>) + o que o reader
 /// materializa do row group. Nao depende do tamanho do objeto.
 ///
+/// Consistencia (importante em producao): cada Range GET e uma requisicao independente. Se o
+/// objeto for sobrescrito por outro produtor no meio da leitura, sem cuidado o reader monta um
+/// arquivo Frankenstein — footer de uma versao, column chunks de outra — e o resultado ou
+/// explode em parse error ou, pior, insere dado inconsistente silenciosamente. Para evitar isso,
+/// o stream captura o <c>ETag</c> do objeto em <see cref="GetObjectInfoAsync"/> e envia
+/// <c>If-Match</c> em toda requisicao: se o conteudo mudar, o S3 responde 412 em vez de devolver
+/// bytes de outra versao. A mensagem falha de forma limpa e volta para a fila.
+///
 /// Premissa: acesso sequencial (um row group por vez, coluna por coluna), que e como o
 /// <see cref="ParquetProcessor"/> consome. O cache nao e thread-safe por design.
 /// </summary>
@@ -37,6 +53,10 @@ public sealed class S3RangeStream : Stream
     private readonly string _key;
     private readonly long _length;
     private readonly int _maxFetchBytes;
+    private readonly string? _etag;
+    private readonly bool _pinVersion;
+    private readonly ILogger? _logger;
+    private readonly bool _trace;
 
     private byte[] _buffer = [];
     private long _bufferStart;
@@ -49,17 +69,23 @@ public sealed class S3RangeStream : Stream
     /// <summary>Quantidade de requisicoes Range feitas.</summary>
     public long Requests { get; private set; }
 
-    public S3RangeStream(IAmazonS3 s3, string bucket, string key, long length, int maxFetchBytes)
+    public S3RangeStream(IAmazonS3 s3, string bucket, string key, long length, int maxFetchBytes,
+        string? etag = null, bool pinVersion = true, ILogger? logger = null, bool trace = false)
     {
         _s3 = s3;
         _bucket = bucket;
         _key = key;
         _length = length;
         _maxFetchBytes = Math.Max(MinFetchBytes, maxFetchBytes);
+        _etag = etag;
+        _pinVersion = pinVersion;
+        _logger = logger;
+        _trace = trace;
     }
 
-    /// <summary>Descobre o tamanho do objeto (necessario para ler o footer pelo fim).</summary>
-    public static async Task<long> GetObjectSizeAsync(IAmazonS3 s3, string bucket, string key, CancellationToken ct)
+    /// <summary>Tamanho + ETag do objeto (necessarios para ler o footer pelo fim e pinar a versao).</summary>
+    public static async Task<S3ObjectInfo> GetObjectInfoAsync(
+        IAmazonS3 s3, string bucket, string key, CancellationToken ct)
     {
         var meta = await s3.GetObjectMetadataAsync(new GetObjectMetadataRequest
         {
@@ -67,7 +93,7 @@ public sealed class S3RangeStream : Stream
             Key = key
         }, ct);
 
-        return meta.ContentLength;
+        return new S3ObjectInfo(meta.ContentLength, meta.ETag, meta.VersionId);
     }
 
     public override bool CanRead => true;
@@ -146,12 +172,21 @@ public sealed class S3RangeStream : Stream
         _bufferStart = offset;
         var end = offset + length - 1;
 
-        using var response = await _s3.GetObjectAsync(new GetObjectRequest
+        var request = new GetObjectRequest
         {
             BucketName = _bucket,
             Key = _key,
             ByteRange = new ByteRange(offset, end)
-        }, ct);
+        };
+
+        // Pinning: se o objeto for sobrescrito no meio da leitura, isto vira 412 em vez de
+        // silenciosamente misturar bytes de duas versoes diferentes.
+        if (_pinVersion && !string.IsNullOrEmpty(_etag))
+        {
+            request.EtagToMatch = _etag;
+        }
+
+        using var response = await _s3.GetObjectAsync(request, ct);
 
         var wanted = (int)length;
         if (_buffer.Length < wanted) _buffer = new byte[wanted];
@@ -167,6 +202,13 @@ public sealed class S3RangeStream : Stream
         _bufferLen = read;
         TotalBytesFetched += read;
         Requests++;
+
+        if (_trace && _logger is not null)
+        {
+            _logger.LogInformation(
+                "[range #{N}] offset={Offset:N0} len={Len:N0} (fim={End:N0}) do objeto de {Total:N0} bytes",
+                Requests, offset, read, end, _length);
+        }
     }
 
     public override void Flush() { }
