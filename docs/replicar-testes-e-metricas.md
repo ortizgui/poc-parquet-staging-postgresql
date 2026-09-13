@@ -80,7 +80,15 @@ O compose também expõe os knobs do worker, todos com default seguro:
 |---|---|---|---|
 | 512 MB | `S3Range` | 108–132 MiB (21–26%) | ok · 0 erros · 29,6 MB transferidos (2,8%) em 120 requisições |
 | 512 MB | `LocalFile` | ~100 MiB (19%) | ok · 0 erros · 1.040,8 MB (100%) em 1 requisição |
-| 128 MB | qualquer | — | **OOMKilled** (exit 137) no startup: o piso do runtime é ~150–200 MB |
+| 128 MB | `S3Range` | 108,5 MiB | ok · 0 erros · 1 entrega |
+| 96 MB | `S3Range` | 93,6 MiB | ok · 0 erros · 1 entrega |
+| 80 MB | `S3Range` | 76,1 MiB | **OOMKilled** (exit 137) após 247.779 linhas — **sem exceção no log** |
+
+**O piso não é uma constante do runtime — é o row group.** O worker *inicia* até com 32 MB (ocioso em
+~30 MiB); o que não cabe é o processamento. Para este arquivo (20k linhas por row group, 32,5 MB
+descomprimidos) a fronteira fica entre 80 e 96 MB. Note que o pico **se adapta ao limite**: 108 MiB
+com 128 MB e 93 MiB com 96 MB — o GC é ciente do cgroup e aperta a coleta sob pressão. Para baixar o
+piso, reduza `--row-group-rows` no gerador; apertar o limite do pod não faz um row group grande caber.
 
 Com o arquivo de 358,9 MB (20 row groups, 5 de 40 colunas): `S3Range` 95 MiB / 10,4 MB (2,9%) /
 44 requisições — `LocalFile` 91 MiB / 358,9 MB (100%) / 1.
@@ -198,7 +206,7 @@ numérico em `docs/memory-test-results.json`.
 | Sintoma | Causa provável | O que fazer |
 |---|---|---|
 | A contagem final veio **maior** que o esperado | Fila contaminada: mensagem residual entregue junto com o disparo | O runner já drena e espera a propagação do `purge`. Se usou `--skip-purge`, não use para evidência. |
-| Resultado **`timeout`** com o container morto | `OOMKilled` sem exceção no log | O runner corrigido detecta via `State.OOMKilled`. Confira `docker inspect poc-consumer --format '{{.State.OOMKilled}}'`. |
+| Resultado **`timeout`** com o container morto | `OOMKilled` **sem exceção no log** — medido: 0 ocorrências de `OutOfMemoryException` em todos os limites | O runner detecta via `State.OOMKilled` (não pela exceção). Confira `docker inspect poc-consumer --format '{{.State.OOMKilled}}'` — deve dar `true` com `exit 137`. |
 | Mensagem foi para a **DLQ** sem erro aparente | Ingestão mais longa que o visibility timeout | Confira a regra do heartbeat no README; o worker deriva o valor e nunca aceita heartbeat ≥ timeout. |
 | `docker compose up` falha no **localstack** | A tag `latest` passou a exigir license token (sai com código 55) | A POC usa `ministack` (MIT, drop-in na mesma porta). Ver comentário no `docker-compose.yml`. |
 | Painel do Grafana vazio | Prometheus sem alvo, ou a stack subiu antes do worker | `docker compose logs prometheus`; alvo é `consumer:9464`. |

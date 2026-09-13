@@ -181,8 +181,11 @@ Para referência, com o arquivo de 358,9 MB (20 row groups, 5 de 40 colunas):
 | `S3Range` | 95 MiB | 10,4 MB (**2,9%**) | 44 |
 | `LocalFile` | 91 MiB | 358,9 MB (100%) | 1 |
 
-**Piso do runtime:** ~150–200 MB. Com 128 MB o container é morto pelo kernel no startup
-(`OOMKilled`, exit 137) antes de processar qualquer coisa — AWS SDK + Npgsql + GC custam isso.
+**O piso não é uma constante do runtime — quem manda é o row group.** Medido com o arquivo de
+1.040,8 MB: o worker passa em **96 MB** e morre em **80 MB** (row groups de 20k linhas, 32,5 MB
+descomprimidos), e *inicia* até com 32 MB. O GC do .NET é ciente do cgroup e coleta mais agressivo
+sob pressão — o mesmo arquivo pica em 108 MiB com limite de 128 MB e em 93 MiB com limite de 96 MB.
+Para baixar o piso, reduza o row group no writer; apertar o limite da task não resolve.
 
 ### 5.2 Task definition (referência)
 
@@ -451,7 +454,9 @@ implementa a mesma semântica de Range. A diferença é **latência e IAM**, nã
 - **O row group é o piso.** Um arquivo gravado com um único row group gigante não pode ser paginado
   pelo leitor — o pico vira o row group. A alavanca nesse caso é a **projeção de colunas** e,
   idealmente, **reescrever o arquivo com row groups menores** (o writer é nosso).
-- **Piso de memória do runtime:** ~150–200 MB. Não vale tentar 128 MB.
+- **O piso de memória é o row group, não o runtime.** Medido: 96 MB passa, 80 MB morre, e o worker
+  inicia até com 32 MB. A falha é `OOMKilled` **sem exceção no log** — não conte com
+  `OutOfMemoryException` para detectar (medido: 0 ocorrências em todos os limites).
 - **Acesso sequencial por design.** O `S3RangeStream` não é thread-safe; o consumo é um row group
   por vez. Paralelizar row groups exigiria múltiplos streams — possível, fora do escopo da POC.
 - **Many small files:** o modelo é 1 mensagem = 1 arquivo grande. Para muitos arquivos pequenos, o

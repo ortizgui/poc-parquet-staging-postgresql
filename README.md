@@ -521,8 +521,15 @@ por nenhum código** e foi removido — paralelismo se faz por task, não por wo
 
 ## Limitações conhecidas
 
-- **Limite mínimo viável de memória**: ~150-200 MB para este runtime. Com 128 MB o container é
-  morto pelo kernel antes de processar qualquer coisa (`OOMKilled`, exit 137).
+- **O piso de memória NÃO é uma constante do runtime — quem manda é o row group.** Medido com o
+  arquivo de 1 GiB (row groups de 20k linhas, 32,5 MB descomprimidos): **passa em 96 MB, morre em
+  80 MB**. O worker *inicia* até com 32 MB (ocioso em ~30 MiB) — o que não cabe é o processamento.
+- **O pico se adapta ao limite.** O GC do .NET é ciente do cgroup e coleta mais agressivo sob
+  pressão: o mesmo arquivo pica em 108 MiB com limite de 128 MB e em 93 MiB com limite de 96 MB.
+  Para baixar o piso, reduza o **row group** no writer — não o lote de flush.
+- **A falha por memória não gera exceção.** Em nenhum limite testado apareceu `OutOfMemoryException`
+  no log. O kernel mata o container (`OOMKilled`, exit 137) sem que o runtime levante nada — por
+  isso o runner checa `State.OOMKilled` em vez da exceção.
 - **O paralelismo é por task, e cada task paga o próprio pico**: dimensione o limite como
   `(baseline do runtime ~60 MB) + (row group × multiplicador)`. N tasks em paralelo = N × esse
   valor, mas em máquinas/limites diferentes — não há memória compartilhada entre elas.
