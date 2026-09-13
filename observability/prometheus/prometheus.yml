@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Metricas da aplicacao (poc_*) + processo/GC do worker
+  - job_name: poc-consumer
+    static_configs:
+      - targets: ["consumer:9464"]
+
+  # Metricas do POD: memoria vs limite, OOM, CPU, throttling
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]

@@ -1,0 +1,78 @@
+{
+  "descricao": "Resultados medidos do teste de paginacao/memoria da ingestao Parquet -> PostgreSQL",
+  "medido_em": "2026-09-13",
+  "ambiente": {
+    "runtime": ".NET 10.0.12 (LTS) / SDK 10.0.401",
+    "host": "Linux aarch64, 8 vCPU, 7.4 GB RAM",
+    "s3_sqs": "ministack 1.5.11 (local — o download nao e limitado por rede, entao a falha do baseline e rapida)",
+    "limite_do_pod": "512 MB (mem_limit + memswap_limit, sem swap)",
+    "gc": "DOTNET_gcServer=0, DOTNET_GCHeapHardLimitPercent=0x4B (75% do cgroup = ~384 MB de heap gerenciado)",
+    "observacao": "S3 local faz o baseline falhar em ~2s; em S3 real o download e mais lento e a curva sobe mais devagar, mas o pico e o mesmo."
+  },
+  "arquivos_de_teste": [
+    { "nome": "prod_200k_1rg", "rows": 200000, "colunas": 40, "disco_mb": 167.9, "row_groups": 1,  "maior_row_group_mb": 312.7 },
+    { "nome": "prod_200k_10rg", "rows": 200000, "colunas": 40, "disco_mb": 179.5, "row_groups": 10, "maior_row_group_mb": 32.5 },
+    { "nome": "prod_400k_20rg", "rows": 400000, "colunas": 40, "disco_mb": 358.9, "row_groups": 20, "maior_row_group_mb": 32.5 }
+  ],
+  "resultados": [
+    {
+      "codigo": "antes (.NET 10, MemoryStream + acumula arquivo inteiro)",
+      "arquivo": "prod_200k_10rg", "limite_mb": 512,
+      "resultado": "nao-deterministico",
+      "detalhe": "1a rodada: concluiu com pico de 363.4 MiB (71% do limite) — +197324 ins ~2676 upd. 2a rodada, MESMO arquivo e mesmo limite: OutOfMemoryException, 0 linhas, pico 226.4 MiB.",
+      "pico_mb": 363.4, "linhas_gravadas": 197324
+    },
+    {
+      "codigo": "antes (.NET 10, MemoryStream + acumula arquivo inteiro)",
+      "arquivo": "prod_200k_1rg", "limite_mb": 512,
+      "resultado": "falhou",
+      "detalhe": "System.OutOfMemoryException em ParquetProcessor.cs:37 (MemoryStream.set_Capacity), durante o download. 0 linhas.",
+      "pico_mb": 226.6, "linhas_gravadas": 0
+    },
+    {
+      "codigo": "antes (.NET 10, MemoryStream + acumula arquivo inteiro)",
+      "arquivo": "prod_400k_20rg", "limite_mb": 512,
+      "resultado": "falhou",
+      "detalhe": "System.OutOfMemoryException, 0 linhas. A mensagem volta para a fila e reprocessa em loop (sem DLQ no fluxo direct).",
+      "pico_mb": 233.5, "linhas_gravadas": 0
+    },
+    {
+      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
+      "arquivo": "prod_400k_20rg", "limite_mb": 512,
+      "resultado": "ok",
+      "detalhe": "Arquivo 2.1x MAIOR que o do baseline, com 4x menos memoria. +389417 ins ~10521 upd -0 err / 400000 linhas lidas. Heap gerenciado ficou entre 12 e 32 MB durante todo o processamento.",
+      "pico_mb": 95.4, "linhas_gravadas": 389417
+    },
+    {
+      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
+      "arquivo": "prod_200k_1rg", "limite_mb": 512,
+      "resultado": "ok",
+      "detalhe": "Um unico row group de 312.7 MB descomprimidos. Passa porque a projecao de colunas le 5 de 40 colunas: o custo e das colunas lidas, nao do row group inteiro.",
+      "pico_mb": 149.3, "linhas_gravadas": 197262
+    },
+    {
+      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
+      "arquivo": "prod_400k_20rg", "limite_mb": 128,
+      "resultado": "OOMKilled",
+      "detalhe": "Container morto pelo kernel (exit 137, OOMKilled=true). 128 MB nao comporta nem o runtime (.NET + AWS SDK + Npgsql + GC).",
+      "pico_mb": 0, "linhas_gravadas": 0
+    },
+    {
+      "codigo": "depois (.NET 10, streaming para disco + flush por row group)",
+      "arquivo": "prod_200k_1rg", "limite_mb": 128,
+      "resultado": "OOMKilled",
+      "detalhe": "Mesmo comportamento: limite abaixo do minimo viavel do runtime. Piso real = baseline do runtime (~60 MB) + row group x multiplicador.",
+      "pico_mb": 0, "linhas_gravadas": 0
+    }
+  ],
+  "idempotencia": {
+    "cenario": "reprocessar prod_200k_1rg com a tabela ja populada (sem truncar)",
+    "resultado": "+0 ins ~5395 upd, contagem estavel em 197262 linhas",
+    "leitura": "Estado final e idempotente: nao insere de novo e a contagem nao muda. Os UPDATEs sao churn de chaves duplicadas DENTRO do arquivo cruzando lotes (a primeira ocorrencia vence por lote). Zero update so com dado sem duplicata de chave — o repo ja tem scripts/generate_unique_test_data.py para isso."
+  },
+  "conclusao": {
+    "formula": "pico ~= 60 MB (baseline do runtime) + bytes descomprimidos DAS COLUNAS LIDAS no maior row group x 2 a 4",
+    "regra": "O tamanho do ARQUIVO nao define o pico; o que define e (row group x colunas lidas). Por isso o row_group_size e decisao de quem ESCREVE o parquet — e a projecao de colunas e o ganho mais barato num schema largo.",
+    "evidencia_chave": "O arquivo de 358.9 MB (20 row groups) passou com pico de 95 MiB onde o de 179.5 MB (arquivo menor, mas com o codigo antigo) falhou com 226 MiB."
+  }
+}

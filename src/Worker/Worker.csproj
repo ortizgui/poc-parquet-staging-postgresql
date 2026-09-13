@@ -6,10 +6,20 @@
     <RootNamespace>PocWorker</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="AWSSDK.S3" Version="3.7.*" />
-    <PackageReference Include="AWSSDK.SQS" Version="3.7.*" />
-    <PackageReference Include="Parquet.Net" Version="5.*" />
-    <PackageReference Include="Npgsql" Version="9.*" />
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.*" />
+    <!--
+      Versoes pinadas: build reproduzivel.
+      Antes: AWSSDK 3.7.* / Parquet.Net 5.* / Npgsql 9.* / Hosting 10.* (wildcards — o build
+      podia puxar patch diferente a cada restore e invalidar o teste de memoria).
+
+      Ficamos no mesmo major de cada pacote: existem majors mais novos (AWSSDK 4.x,
+      Parquet.Net 6.x, Npgsql 10.x), mas trocar major e uma mudanca com blast radius proprio
+      e nao faz parte deste ajuste de paginacao/memoria.
+    -->
+    <PackageReference Include="AWSSDK.S3" Version="3.7.511.8" />
+    <PackageReference Include="AWSSDK.SQS" Version="3.7.502.57" />
+    <PackageReference Include="Parquet.Net" Version="5.6.1" />
+    <PackageReference Include="Npgsql" Version="9.0.5" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageReference Include="prometheus-net" Version="8.2.1" />
   </ItemGroup>
 </Project>

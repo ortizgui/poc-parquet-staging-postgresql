@@ -26,8 +26,10 @@ builder.Services.AddSingleton<IAmazonS3>(_ => new AmazonS3Client(new BasicAWSCre
 builder.Services.AddSingleton<IAmazonSQS>(_ => new AmazonSQSClient(new BasicAWSCredentials("test", "test"), sqsConfig));
 
 builder.Services.AddSingleton<DatabaseService>();
+builder.Services.AddSingleton<IngestMetrics>();
 builder.Services.AddSingleton<ParquetProcessor>();
 builder.Services.AddHostedService<SqsConsumerService>();
+builder.Services.AddHostedService<MetricsServerService>();
 
 var host = builder.Build();
 host.Run();

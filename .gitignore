@@ -19,11 +19,12 @@ data/input/*.parquet
 # OS
 .DS_Store
 
-# Images
-
+# Imagens
 *.png
 *.csv
 *.html
+# ...exceto as evidencias versionadas da documentacao
+!docs/assets/*.png
 # Simulation reports
 reports/
 
@@ -37,3 +38,7 @@ scripts/process_file.py
 scripts/merge_staging.py
 scripts/simulate_load.py
 run_simulation.sh
+
+# Harness local de validacao (bind mount nao atravessa dind)
+harness/
+!docs/assets/*.csv

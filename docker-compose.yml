@@ -17,35 +17,61 @@ services:
       timeout: 5s
       retries: 5
 
+  # Emulador AWS local.
+  # ATENCAO: localstack/localstack:latest passou a exigir LOCALSTACK_AUTH_TOKEN
+  # (sai com codigo 55/ license activation failed) — trocamos pelo ministack,
+  # que e free, MIT e drop-in na mesma porta 4566.
   ministack:
-    image: localstack/localstack:latest
+    image: ministackorg/ministack:latest
     container_name: poc-ministack
     environment:
-      SERVICES: s3,sqs,sns
+      GATEWAY_PORT: "4566"
+      LOG_LEVEL: INFO
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
     ports:
       - "4566:4566"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
+      # a imagem do ministack nao tem curl/wget — usa o python que ja vem nela
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4566/health', timeout=5).status==200 else 1)\""]
       interval: 5s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 20
+      start_period: 15s
 
-  # Consumer: consome eventos S3 da SQS e faz bulk insert direto na custody_position
+  # Consumer: consome eventos S3 da SQS e faz bulk insert direto na custody_position.
   # Para escalar: docker compose up -d --scale consumer=3
+  #
+  # MEMORIA: e o eixo do teste de paginacao. O limite abaixo e o que prova que o
+  # worker le um arquivo maior que a propria RAM sem estourar.
   consumer:
     build:
       context: .
       dockerfile: src/Worker/Dockerfile
     container_name: poc-consumer
+    mem_limit: 512m
+    memswap_limit: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment:
       DOTNET_ENVIRONMENT: Production
+      # GC: o runtime ja detecta o limite do cgroup e trava o heap em ~75%.
+      # Explicitar deixa o teste reproduzivel entre ambientes.
+      DOTNET_gcServer: "0"
+      DOTNET_GCHeapHardLimitPercent: "0x4B"
       Consumer__Target: direct
       Consumer__QueueName: poc-notification-queue
-      Consumer__MaxWorkers: 4
+      Consumer__MaxWorkers: 1
       Consumer__ConsumerId: dotnet-worker
+      # Paginacao: linhas acumuladas antes de cada flush no banco
+      Consumer__FlushBatchSize: "2000"
+      # Onde o parquet e materializado em disco (nunca inteiro na RAM)
+      Consumer__TempPath: /tmp/poc-ingest
+      PostgreSQL__BatchSize: "2000"
+      Metrics__Port: "9464"
       AWS__ServiceURL: http://ministack:4566
       AWS__Region: us-east-1
       AWS__AccessKey: test
@@ -54,11 +80,60 @@ services:
       PostgreSQL__Database: pocdb
       PostgreSQL__Username: pocuser
       PostgreSQL__Password: pocpass
+    ports:
+      - "9464:9464"
     depends_on:
       postgres:
         condition: service_healthy
       ministack:
         condition: service_healthy
 
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: poc-prometheus
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - consumer
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: poc-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  # Metricas de container (o golden signal de saturations e do POD, nao do processo)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: poc-cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      - consumer
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:
