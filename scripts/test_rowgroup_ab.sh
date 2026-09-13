@@ -12,6 +12,27 @@
 # imprime numeros nao garante nada; este tem asercao.
 #
 # -----------------------------------------------------------------------------
+# OS ARQUIVOS DE TESTE NAO SAO VERSIONADOS — SÃO GERADOS
+#
+# Nao existe parquet de teste no git, de proposito: o cenario precisa de ~1 GB, e
+# binario desse tamanho no repositorio e inviavel. O que e versionado e o GERADOR
+# (scripts/generate_large_parquet.py) + este script, que reproduz os dois arquivos
+# de forma deterministica (--seed 42) em qualquer maquina.
+#
+# Para gerar SO os arquivos, sem rodar o teste:
+#
+#   # N row groups (row groups de 20k linhas) — o cenario que deve CONCLUIR
+#   python3 scripts/generate_large_parquet.py --rows 1160000 --row-group-rows 20000 \
+#       --columns 40 --output data/ab_muitos_rg.parquet --upload
+#
+#   # 1 row group unico com todas as linhas — o cenario que deve ESTOURAR
+#   python3 scripts/generate_large_parquet.py --rows 1160000 --row-group-rows 1160000 \
+#       --columns 40 --output data/ab_um_rg.parquet --upload
+#
+# Smoke test rapido (valida a mecanica em ~5s, sem 1 GB):
+#   ./scripts/test_rowgroup_ab.sh --rows 40000 --limit-mb 64
+#
+# -----------------------------------------------------------------------------
 # HIGIENE DA FILA (a parte que mais da errado — leia antes de mexer)
 #
 # 1. PurgeQueue e ASSINCRONO (pode levar ate 60s). Confirmar "0 mensagens" uma vez
@@ -27,26 +48,31 @@
 #
 # Uso:
 #   ./scripts/test_rowgroup_ab.sh --limit-mb 192
-#   ./scripts/test_rowgroup_ab.sh --limit-mb 512 --rows 1160000 --columns 40
+#   ./scripts/test_rowgroup_ab.sh --rows 40000 --limit-mb 64     # smoke
+#   ./scripts/test_rowgroup_ab.sh --reuse                        # nao regera os arquivos
 # =============================================================================
 
 set -uo pipefail
 
 LIMIT_MB=192
 ROWS=1160000
+MANY_RG_ROWS=20000
 COLUMNS=40
 DATA_DIR="${DATA_DIR:-data}"
 BUCKET="${S3_BUCKET:-poc-bucket}"
 OUT_DIR="reports"
+REUSE=0
 FALHAS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --limit-mb) LIMIT_MB="$2"; shift 2 ;;
-    --rows)     ROWS="$2"; shift 2 ;;
-    --columns)  COLUMNS="$2"; shift 2 ;;
-    --out-dir)  OUT_DIR="$2"; shift 2 ;;
-    -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+    --limit-mb)     LIMIT_MB="$2"; shift 2 ;;
+    --rows)         ROWS="$2"; shift 2 ;;
+    --many-rg-rows) MANY_RG_ROWS="$2"; shift 2 ;;
+    --columns)      COLUMNS="$2"; shift 2 ;;
+    --out-dir)      OUT_DIR="$2"; shift 2 ;;
+    --reuse)        REUSE=1; shift ;;
+    -h|--help)      sed -n '2,52p' "$0"; exit 0 ;;
     *) echo "opcao desconhecida: $1"; exit 1 ;;
   esac
 done
@@ -56,29 +82,51 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG="$OUT_DIR/rowgroup_ab_${STAMP}.log"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-F_MUITOS="$DATA_DIR/ab_${ROWS}_muitos_rg.parquet"
-F_UM="$DATA_DIR/ab_${ROWS}_um_rg.parquet"
+F_MUITOS="$DATA_DIR/ab_${ROWS}_${MANY_RG_ROWS}rg.parquet"
+F_UM="$DATA_DIR/ab_${ROWS}_1rg.parquet"
 
-# --- 1. gera os dois arquivos: mesmo total de linhas, row group diferente -----
-log "gerando os dois arquivos ($ROWS linhas, $COLUMNS colunas)"
-python3 scripts/generate_large_parquet.py --rows "$ROWS" --row-group-rows 20000 \
-    --columns "$COLUMNS" --output "$F_MUITOS" >>"$LOG" 2>&1 || { echo "falha ao gerar $F_MUITOS"; exit 1; }
-python3 scripts/generate_large_parquet.py --rows "$ROWS" --row-group-rows "$ROWS" \
-    --columns "$COLUMNS" --output "$F_UM" >>"$LOG" 2>&1 || { echo "falha ao gerar $F_UM"; exit 1; }
+# --- 1. gera (e sobe) os dois arquivos: mesmo total de linhas, row group diferente
+if [[ "$REUSE" == "1" && -f "$F_MUITOS" && -f "$F_UM" ]]; then
+  log "reusando os arquivos existentes (--reuse)"
+else
+  log "gerando: $ROWS linhas, $COLUMNS colunas"
+  log "  MUITOS_RG: row groups de $MANY_RG_ROWS linhas"
+  python3 scripts/generate_large_parquet.py --rows "$ROWS" --row-group-rows "$MANY_RG_ROWS" \
+      --columns "$COLUMNS" --output "$F_MUITOS" --upload >>"$LOG" 2>&1 \
+      || { echo "falha ao gerar/subir $F_MUITOS"; exit 1; }
+  log "  UM_RG: 1 unico row group com as $ROWS linhas"
+  # --row-group-rows == --rows faz o writer emitir UM unico row group.
+  python3 scripts/generate_large_parquet.py --rows "$ROWS" --row-group-rows "$ROWS" \
+      --columns "$COLUMNS" --output "$F_UM" --upload >>"$LOG" 2>&1 \
+      || { echo "falha ao gerar/subir $F_UM"; exit 1; }
+fi
 
+# Confere o que foi realmente escrito (o teste depende disso, nao do que pedimos).
 for f in "$F_MUITOS" "$F_UM"; do
   python3 - "$f" <<'PY'
 import sys, pyarrow.parquet as pq
 md = pq.ParquetFile(sys.argv[1]).metadata
 sz = [md.row_group(i).total_byte_size for i in range(md.num_row_groups)]
-print(f"  {sys.argv[1]}: {md.num_row_groups} row group(s), maior descomprimido = {max(sz)/1024/1024:.1f} MB")
+print(f"  {sys.argv[1]}: {md.num_row_groups} row group(s), "
+      f"maior descomprimido = {max(sz)/1024/1024:.1f} MB, {md.num_rows:,} linhas")
 PY
 done
 
-# --- 2. sobe os dois para o S3 ------------------------------------------------
-log "subindo para o S3"
-python3 scripts/upload_to_s3.py --file "$F_MUITOS" --key "input/$(basename "$F_MUITOS")" >>"$LOG" 2>&1
-python3 scripts/upload_to_s3.py --file "$F_UM" --key "input/$(basename "$F_UM")" >>"$LOG" 2>&1
+# --- 2. garante o bucket antes de subir (idempotente) ------------------------
+if [[ "$REUSE" == "1" ]]; then
+  log "subindo os arquivos existentes para o S3"
+  BUCKET="$BUCKET" python3 - "$F_MUITOS" "$F_UM" <<'PY'
+import os, sys, boto3
+s3 = boto3.client('s3', endpoint_url=os.getenv('AWS_ENDPOINT_URL', 'http://localhost:4566'),
+                  region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+b = os.getenv('BUCKET', 'poc-bucket')
+try: s3.create_bucket(Bucket=b)
+except Exception: pass
+for f in sys.argv[1:]:
+    s3.upload_file(f, b, f"input/{os.path.basename(f)}")
+    print(f"   input/{os.path.basename(f)}")
+PY
+fi
 
 drena_fila() {
   QUEUE="${SQS_QUEUE:-poc-notification-queue}" DLQ="${SQS_DLQ:-poc-notification-dlq}" python3 - <<'PY'
@@ -134,12 +182,14 @@ roda_cenario() {   # $1=rotulo  $2=key  -> ecoa "resultado|pico|linhas"
   done
   docker logs poc-consumer > "$BASE.worker.log" 2>&1
   local LIN=$(docker compose exec -T postgres psql -U pocuser -d pocdb -t -A -c 'SELECT count(*) FROM custody_position;' 2>/dev/null | tr -d '[:space:]')
-  log "  -> $RESULT | pico ${PEAK} MiB | ${LIN} linhas"
+  log "  -> $RESULT | pico ${PEAK} MiB | ${LIN} linhas | OutOfMemoryException no log: $(grep -c 'OutOfMemoryException' "$BASE.worker.log")"
   echo "${RESULT}|${PEAK}|${LIN}"
 }
 
-R_MUITOS=$(roda_cenario MUITOS_RG "input/$(basename "$F_MUITOS")" | tail -1)
-R_UM=$(roda_cenario UM_RG "input/$(basename "$F_UM")" | tail -1)
+K_MUITOS="input/$(basename "$F_MUITOS")"
+K_UM="input/$(basename "$F_UM")"
+R_MUITOS=$(roda_cenario MUITOS_RG "$K_MUITOS" | tail -1)
+R_UM=$(roda_cenario UM_RG "$K_UM" | tail -1)
 
 RES_MUITOS="${R_MUITOS%%|*}"; PICO_MUITOS=$(echo "$R_MUITOS" | cut -d'|' -f2)
 RES_UM="${R_UM%%|*}";         PICO_UM=$(echo "$R_UM" | cut -d'|' -f2)

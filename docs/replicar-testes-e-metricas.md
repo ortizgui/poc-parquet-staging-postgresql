@@ -53,6 +53,45 @@ python3 scripts/plot_memory_test.py --csv reports/memory_test_<stamp>.csv
 
 Os artefatos saem em `reports/`: o `.log`, o `.csv` (memória × tempo) e o `.worker.log`.
 
+### Os arquivos de teste — gerados, não versionados
+
+**Não existe parquet de teste no git, de propósito.** O cenário precisa de ~1 GB, e binário desse
+tamanho no repositório é inviável. O que é versionado é o **gerador** + o script do A/B, que
+reproduzem os arquivos de forma determinística (`--seed 42`) em qualquer máquina.
+
+O controle é a flag **`--row-group-rows`** — é ela, não o tamanho do arquivo, que define o piso de
+memória do leitor:
+
+```bash
+# N row groups (row groups de 20k linhas) — o cenário que deve CONCLUIR
+python3 scripts/generate_large_parquet.py --rows 1160000 --row-group-rows 20000 \
+    --columns 40 --output data/ab_muitos_rg.parquet --upload
+
+# 1 row group único com todas as linhas — o cenário que deve ESTOURAR
+# (--row-group-rows == --rows faz o writer emitir um único row group)
+python3 scripts/generate_large_parquet.py --rows 1160000 --row-group-rows 1160000 \
+    --columns 40 --output data/ab_um_rg.parquet --upload
+```
+
+Verificado (mesmo total de linhas, 40k, 40 colunas — o mecanismo em miniatura):
+
+- `--row-group-rows 20000` → **2 row groups**, maior descomprimido **32,5 MB**, 35,89 MB em disco
+- `--row-group-rows 40000` → **1 row group**, maior descomprimido **63,9 MB**, 34,90 MB em disco
+
+O arquivo é o mesmo; o piso de memória do leitor dobra. É exatamente isso que o A/B mede.
+
+Para rodar o A/B inteiro (gera os dois, sobe e testa, com asserção):
+
+```bash
+./scripts/test_rowgroup_ab.sh --limit-mb 192
+
+# smoke rápido, valida a mecânica em ~5s sem gerar 1 GB
+./scripts/test_rowgroup_ab.sh --rows 40000 --limit-mb 64
+```
+
+> Os arquivos gerados caem em `data/`, que está no `.gitignore` (`data/input/*.parquet`) — confirme
+> que o seu padrão cobre o caminho que você usar.
+
 ---
 
 ## 3. Escolhendo o limite de memória
