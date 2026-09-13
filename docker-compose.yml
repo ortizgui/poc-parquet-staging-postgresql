@@ -50,12 +50,18 @@ services:
       context: .
       dockerfile: src/Worker/Dockerfile
     container_name: poc-consumer
-    mem_limit: 512m
-    memswap_limit: 512m
+    # O limite e o eixo do teste: escolha por env sem editar arquivo.
+    #   CONSUMER_MEM_LIMIT=128m  -> demonstra o OOMKilled (o piso do runtime e ~150-200MB)
+    #   CONSUMER_MEM_LIMIT=512m -> default; arquivo de 1GB (2x o limite) passa
+    #   CONSUMER_MEM_LIMIT=1g    -> comparativo com mais folga
+    # memswap IGUAL ao limite de proposito: com swap disponivel o container sobrevive
+    # a pressao de memoria e o teste mente — o ponto e nao ter para onde crescer.
+    mem_limit: ${CONSUMER_MEM_LIMIT:-512m}
+    memswap_limit: ${CONSUMER_MEM_LIMIT:-512m}
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: ${CONSUMER_MEM_LIMIT:-512m}
     environment:
       DOTNET_ENVIRONMENT: Production
       # GC: o runtime ja detecta o limite do cgroup e trava o heap em ~75%.
@@ -82,13 +88,13 @@ services:
       #                das colunas lidas (ex.: 5 de 40).
       #   LocalFile -> baixa o objeto para arquivo temporario e le local. 1 requisicao grande,
       #                exige disco do tamanho do objeto.
-      Consumer__ReadMode: S3Range
+      Consumer__ReadMode: ${CONSUMER_READ_MODE:-S3Range}
       Consumer__RangeBlockMb: "8"
       # Pinning: envia If-Match com o ETag do objeto em toda requisicao Range. Se o arquivo for
       # sobrescrito durante a leitura, o S3 devolve 412 em vez de misturar bytes de duas versoes.
-      Consumer__PinObjectVersion: "true"
+      Consumer__PinObjectVersion: "${CONSUMER_PIN_OBJECT_VERSION:-true}"
       # Loga cada Range GET (offset/tamanho). Use para provar a sequencia de leitura; ruidoso.
-      Consumer__RangeTraceLog: "false"
+      Consumer__RangeTraceLog: "${CONSUMER_RANGE_TRACE_LOG:-false}"
       # Paginacao: linhas acumuladas antes de cada flush no banco
       Consumer__FlushBatchSize: "2000"
       # Usado apenas no modo LocalFile

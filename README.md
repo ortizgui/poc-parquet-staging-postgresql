@@ -10,6 +10,10 @@ acompanhar o tamanho do arquivo.
 > **Rodando na AWS?** Veja [`docs/aws-producao-ecs-fargate.md`](docs/aws-producao-ecs-fargate.md) —
 > fluxo end-to-end em ECS Fargate, mecânica da leitura parcial com o trace de requisições, policy
 > IAM mínima, dimensionamento, pinning por ETag e o que está provado vs. o que valida no ambiente real.
+>
+> **Quer rodar e medir?** Veja [`docs/replicar-testes-e-metricas.md`](docs/replicar-testes-e-metricas.md) —
+> o ciclo completo (subir, gerar o arquivo, rodar, acompanhar a memória pelo Grafana/Prometheus,
+> A/B entre modos de leitura, exportar a evidência) para replicar em qualquer máquina.
 
 ## Arquitetura
 
@@ -183,6 +187,10 @@ abaixo do limite. É o platô que prova o sucesso.
 ---
 
 ## Teste de Memória (arquivo maior que a RAM do pod)
+
+> O passo a passo replicável (incluindo como ler as métricas pelo Grafana e acompanhar a memória)
+> está em [`docs/replicar-testes-e-metricas.md`](docs/replicar-testes-e-metricas.md).
+> O limite de memória do pod é ajustável por env, sem editar arquivo: `CONSUMER_MEM_LIMIT=128m|512m|1g`.
 
 ### Passo a passo
 
