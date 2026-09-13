@@ -17,7 +17,8 @@
 #    O PurgeQueue do SQS e ASSINCRONO (pode levar ate 60s). O drain purga main E
 #    DLQ, exige visiveis E em-voo = 0, espera uma JANELA DE SETTLE (15s) e
 #    reconfere — so entao libera o disparo. Sem isso, a notificacao do proprio
-#    upload do arquivo para o S3 (tambem assincrona) entra junto com o disparo:
+#    upload do arquivo para o S3 (tambem assincrona — o ministack ENTREGA
+#    S3->SQS normalmente; o drain e por determinismo) entra junto com o disparo:
 #    o MESMO arquivo e processado duas vezes e a contagem final sai inflada, sem
 #    que nada esteja errado no worker. Orcamento total do drain: ~120s.
 #

@@ -338,10 +338,16 @@ sem `container_memory_working_set_bytes` não há como comparar o consumo com o 
 > O `localstack/localstack:latest` passou a exigir `LOCALSTACK_AUTH_TOKEN` e sai com
 > **código 55 / "License activation failed"** — a stack não subia mais.
 >
-> **Notificação S3 → SQS:** o ministack implementa `PutBucketNotificationConfiguration` como
-> control-plane e **não entrega** os eventos na fila. Para o teste local, dispare manualmente com
-> `python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key <key> --mode sqs`
-> (é o que o `run_memory_test.sh` faz).
+> **Notificação S3 → SQS:** o **ministack entrega** os eventos `s3:ObjectCreated:*` na fila (versão
+> atual: PUT, multipart e filtros de prefixo/sufixo). Por determinismo, os scripts de teste usam
+> **dispatch explícito** (`python3 scripts/simulate_s3_notification.py --bucket poc-bucket --key <key>
+> --mode sqs`), e o A/B **desliga temporariamente a notificação do bucket** durante o run (restaura no
+> fim) — não porque a entrega esteja quebrada, mas porque a notificação do upload é assíncrona e pode
+> contaminar a fila entre os cenários (foi o que gerou um falso `out_of_memory` numa execução
+> anterior).
+> Um detalhe histórico: uma configuração de notificação cujo **destino ainda não existia** era aceita
+> em silêncio — parecia "nenhum evento chegando". O mantenedor do ministack informou que essa
+> validação entra na **próxima versão**, quando o dispatch manual pode deixar de ser necessário.
 
 ## Uso Passo a Passo
 

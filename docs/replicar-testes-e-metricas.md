@@ -102,6 +102,11 @@ Para rodar o A/B inteiro (gera os dois, sobe e testa, com asserção):
 > `timeout`/DLQ **não** contam como sucesso do teste (a falha por memória pode, inclusive, mandar a
 > mensagem para a DLQ depois — isso é consequência, não a prova).
 
+> **Notificação S3 → SQS no ministack:** o ministack **entrega** os eventos normalmente. O A/B
+> **desliga temporariamente a notificação do bucket** durante o run (restaura no fim) por
+> **determinismo** — a notificação do upload é assíncrona e pode contaminar a fila entre os cenários.
+> O disparo passa a ser o explícito (`simulate_s3_notification.py --mode sqs`).
+
 > Os arquivos gerados caem em `data/`, que está no `.gitignore` (`data/*.parquet` e
 > `data/**/*.parquet`) — o A/B grava `data/ab_*.parquet` e nada de parquet é versionado.
 > As exceções `!docs/assets/*.png` e `!docs/assets/*.csv` continuam valendo para as evidências.

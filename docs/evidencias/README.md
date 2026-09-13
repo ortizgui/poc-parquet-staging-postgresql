@@ -60,9 +60,10 @@ PATH="$PWD/.venv/bin:$PATH" bash scripts/test_rowgroup_ab.sh --rows 1160000 --li
 ```
 
 O runner:
-1. garante o bucket e **desliga a notificação do bucket** durante o run (evita a notificação S3
-   assíncrona do upload virar mensagem extra — o disparo é explícito, via
-   `simulate_s3_notification.py --mode sqs`);
+1. garante o bucket e **desliga temporariamente a notificação do bucket** durante o run (restaura no
+   fim). O ministack **entrega** os eventos S3→SQS normalmente; o desligamento é por
+   **determinismo**, para a notificação assíncrona do upload não virar mensagem extra — o disparo
+   passa a ser explícito, via `simulate_s3_notification.py --mode sqs`;
 2. em cada cenário: derruba o consumer → drena a fila **com o consumer DOWN** (purge main+DLQ com
    janela de confirmação) → trunca as tabelas → sobe o consumer com o `mem_limit` → drena de novo →
    dispara;

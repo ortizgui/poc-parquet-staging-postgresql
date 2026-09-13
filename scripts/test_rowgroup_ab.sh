@@ -51,13 +51,15 @@
 # 1. PurgeQueue e ASSINCRONO (pode levar ate 60s). Confirmar "0 mensagens" uma vez
 #    nao basta: o drain exige visiveis E em-voo = 0, espera uma JANELA DE SETTLE
 #    (15s) e reconfere, com orcamento total de ~120s.
-# 2. A notificacao de evento do S3 tambem e ASSINCRONA: um upload feito segundos
-#    antes pode ENTREGAR UMA MENSAGEM DEPOIS do purge ter reportado zero. No A/B
-#    isso e fatal: o consumer do MUITOS_RG podia pegar o arquivo de UM_RG e falhar
-#    por memoria — um FALSO FAIL. Correcao em DUAS camadas:
+# 2. A notificacao de evento do S3 tambem e ASSINCRONA (o ministack ENTREGA
+#    S3->SQS normalmente — o problema aqui e a corrida, nao a entrega): um upload
+#    feito segundos antes pode ENTREGAR UMA MENSAGEM DEPOIS do purge ter
+#    reportado zero. No A/B isso e fatal: o consumer do MUITOS_RG podia pegar o
+#    arquivo de UM_RG e falhar por memoria — um FALSO FAIL. Correcao em DUAS
+#    camadas:
 #      a) a notificacao do bucket e DESLIGADA durante o run (config salva e
-#         restaurada no fim, mesmo em falha). O unico disparo passa a ser o
-#         `simulate_s3_notification.py --mode sqs` explicito; e
+#         restaurada no fim, mesmo em falha) PARA DETERMINISMO. O unico disparo
+#         passa a ser o `simulate_s3_notification.py --mode sqs` explicito; e
 #      b) o drain roda com o consumer DOWN, antes de subir, e DE NOVO
 #         imediatamente antes do disparo.
 # 3. Mensagem em voo quando o consumer morre (OOMKilled) fica invisivel por ate
